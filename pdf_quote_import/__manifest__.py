@@ -20,8 +20,8 @@
     'depends': ['base', 'sale_management'],
     'data': [
         'security/ir.model.access.csv',
-        'views/pdf_quote_import_views.xml',
         'wizards/pdf_import_wizard_views.xml',
+        'views/pdf_quote_import_views.xml',
     ],
     'installable': True,
     'application': False,

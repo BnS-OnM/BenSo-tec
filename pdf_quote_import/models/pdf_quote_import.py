@@ -90,9 +90,17 @@ class PdfQuoteImport(models.Model):
                 - Additional keys as needed for sale.order model
         """
         # Basic implementation - can be extended based on specific PDF format
+        note = ''
+        if text:
+            if len(text) > MAX_NOTE_LENGTH:
+                note = text[:MAX_NOTE_LENGTH] + '...'
+                _logger.info('Extracted text truncated to %d characters', MAX_NOTE_LENGTH)
+            else:
+                note = text
+        
         quote_data = {
             'partner_id': self.partner_id.id if self.partner_id else False,
-            'note': text[:MAX_NOTE_LENGTH] if text else '',  # First N chars as note
+            'note': note,
         }
         return quote_data
 
