@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Wizard Form View -->
+    <record id="view_pdf_import_wizard_form" model="ir.ui.view">
+        <field name="name">pdf.import.wizard.form</field>
+        <field name="model">pdf.import.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Import PDF Quote">
+                <group>
+                    <field name="pdf_file" filename="filename" required="1"/>
+                    <field name="filename" invisible="1"/>
+                    <field name="partner_id"/>
+                    <field name="notes"/>
+                </group>
+                <footer>
+                    <button string="Import" name="action_import" type="object" class="btn-primary"/>
+                    <button string="Cancel" class="btn-secondary" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <!-- Wizard Action -->
+    <record id="action_pdf_import_wizard" model="ir.actions.act_window">
+        <field name="name">Import PDF Quote</field>
+        <field name="res_model">pdf.import.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+        <field name="binding_model_id" ref="sale.model_sale_order"/>
+    </record>
+</odoo>
