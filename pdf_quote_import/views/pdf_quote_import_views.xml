@@ -43,10 +43,10 @@
                         <page string="Notes">
                             <field name="notes"/>
                         </page>
-                        <page string="Extracted Text" invisible="not extracted_text">
+                        <page string="Extracted Text" attrs="{'invisible': [('extracted_text', '=', False)]}">
                             <field name="extracted_text"/>
                         </page>
-                        <page string="Errors" invisible="state != 'failed'">
+                        <page string="Errors" attrs="{'invisible': [('state', '!=', 'failed')]}">
                             <field name="error_message"/>
                         </page>
                     </notebook>
