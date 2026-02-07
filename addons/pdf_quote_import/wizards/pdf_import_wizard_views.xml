@@ -28,11 +28,4 @@
         <field name="target">new</field>
         <field name="binding_model_id" ref="sale.model_sale_order"/>
     </record>
-
-    <!-- Menu Item for Wizard -->
-    <menuitem id="menu_pdf_import_wizard" 
-              name="Import PDF Quote" 
-              parent="menu_pdf_quote_import_root" 
-              action="action_pdf_import_wizard" 
-              sequence="2"/>
 </odoo>

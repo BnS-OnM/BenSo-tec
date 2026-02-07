@@ -1,5 +1,6 @@
 from odoo import models, fields, api
 import base64
+import io
 import logging
 
 _logger = logging.getLogger(__name__)
@@ -9,6 +10,9 @@ try:
 except ImportError:
     _logger.warning('PyPDF2 library is not installed. PDF parsing will not work.')
     PyPDF2 = None
+
+# Constants
+MAX_NOTE_LENGTH = 500
 
 
 class PdfQuoteImport(models.Model):
@@ -37,14 +41,27 @@ class PdfQuoteImport(models.Model):
         return super(PdfQuoteImport, self).create(vals)
 
     def extract_pdf_text(self):
-        """Extract text from PDF file"""
+        """Extract text from PDF file
+        
+        Returns:
+            str: Extracted text from all pages of the PDF
+            
+        Raises:
+            ImportError: If PyPDF2 library is not installed
+            Exception: For any PDF parsing errors
+            
+        Side Effects:
+            Updates the extracted_text field on success
+            Updates error_message and state fields on failure
+        """
         self.ensure_one()
         if not PyPDF2:
             raise ImportError('PyPDF2 library is required for PDF parsing. Please install it.')
         
         try:
             pdf_data = base64.b64decode(self.pdf_file)
-            pdf_reader = PyPDF2.PdfReader(pdf_data)
+            pdf_file_obj = io.BytesIO(pdf_data)
+            pdf_reader = PyPDF2.PdfReader(pdf_file_obj)
             
             text_content = []
             for page in pdf_reader.pages:
@@ -60,11 +77,22 @@ class PdfQuoteImport(models.Model):
 
     def parse_quote_data(self, text):
         """Parse quote data from extracted text
-        Override this method to implement custom parsing logic"""
+        
+        Override this method to implement custom parsing logic for specific PDF formats.
+        
+        Args:
+            text (str): The extracted text from the PDF file
+            
+        Returns:
+            dict: Dictionary containing sale order field values. Expected keys include:
+                - partner_id: Customer ID (int or False)
+                - note: Additional notes (str)
+                - Additional keys as needed for sale.order model
+        """
         # Basic implementation - can be extended based on specific PDF format
         quote_data = {
             'partner_id': self.partner_id.id if self.partner_id else False,
-            'note': text[:500] if text else '',  # First 500 chars as note
+            'note': text[:MAX_NOTE_LENGTH] if text else '',  # First N chars as note
         }
         return quote_data
 

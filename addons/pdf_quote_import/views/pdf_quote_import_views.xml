@@ -101,6 +101,12 @@
               parent="menu_pdf_quote_import_root" 
               action="action_pdf_quote_import" 
               sequence="1"/>
+    
+    <menuitem id="menu_pdf_import_wizard" 
+              name="Import PDF Quote" 
+              parent="menu_pdf_quote_import_root" 
+              action="action_pdf_import_wizard" 
+              sequence="2"/>
 
     <!-- Sequence -->
     <record id="seq_pdf_quote_import" model="ir.sequence">
