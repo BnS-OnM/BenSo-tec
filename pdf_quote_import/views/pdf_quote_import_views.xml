@@ -24,7 +24,7 @@
             <form string="PDF Quote Import">
                 <header>
                     <button name="action_import" string="Import PDF" type="object" 
-                            class="btn-primary" invisible="state != 'draft'"/>
+                            class="btn-primary" invisible="state != 'draft'" context="{}"/>
                     <field name="state" widget="statusbar"/>
                 </header>
                 <sheet>
