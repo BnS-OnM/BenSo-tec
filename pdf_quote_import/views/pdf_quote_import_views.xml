@@ -64,6 +64,7 @@
                 <field name="name"/>
                 <field name="filename"/>
                 <field name="partner_id"/>
+                <field name="state"/>
                 <filter string="Draft" name="draft" domain="[('state', '=', 'draft')]"/>
                 <filter string="Imported" name="imported" domain="[('state', '=', 'imported')]"/>
                 <filter string="Failed" name="failed" domain="[('state', '=', 'failed')]"/>
