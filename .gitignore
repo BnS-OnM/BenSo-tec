@@ -58,6 +58,22 @@ addons/web_enterprise/
 
 # Env
 .env
+.env.*
 env/
 venv/
 ENV/
+
+# Secrets and sensitive data
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.yml
+secrets.yaml
+credentials.json
+*.credentials
+config/secrets/
+
+# Local development overrides
+docker-compose.override.yml
+.env.local
