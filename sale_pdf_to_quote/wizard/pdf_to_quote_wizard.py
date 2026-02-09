@@ -215,11 +215,37 @@ class PdfToQuoteWizard(models.TransientModel):
 
     # ---------------- Brand domain & helpers ----------------
 
-    def _brand_domain(self, brand_name):
-        """Filter op jouw Studio-veld voor merk: product_tmpl_id.<BRAND_PROP_FIELD>"""
+    def _brand_domain(self, brand_name, for_model='product.product'):
+        """Generic brand filter over **any** Studio product properties on product.template.
+        - Enumerates all fields on product.template starting with 'product_properties.'
+        - Builds an OR-domain across those fields using ilike brand_name
+        - Works for both product.product (via product_tmpl_id.<prop>) and product.template (<prop>)
+        """
         if not brand_name:
             return []
-        return [(f'product_tmpl_id.{BRAND_PROP_FIELD}', 'ilike', brand_name)]
+        # find all Studio property fields
+        T = self.env['product.template']
+        prop_fields = [fname for fname in T._fields.keys() if fname.startswith('product_properties.')]
+        domain_options = []
+        if for_model == 'product.product':
+            # prefix through product_tmpl_id
+            for fld in prop_fields:
+                domain_options.append((f'product_tmpl_id.{fld}', 'ilike', brand_name))
+        else:  # product.template context
+            for fld in prop_fields:
+                domain_options.append((fld, 'ilike', brand_name))
+        # if no studio fields found, fall back softly to name
+        if not domain_options:
+            if for_model == 'product.product':
+                domain_options.append(('name', 'ilike', brand_name))
+                domain_options.append(('product_tmpl_id.name', 'ilike', brand_name))
+            else:
+                domain_options.append(('name', 'ilike', brand_name))
+        # combine OR chain
+        domain = domain_options[0]
+        for cond in domain_options[1:]:
+            domain = ['|'] + list(domain) + list(cond)
+        return domain
 
     PREFIX_BRAND_MAP = {
         'VRC': 'Vaillant',
@@ -270,7 +296,7 @@ class PdfToQuoteWizard(models.TransientModel):
             groups.append(self._token_group(t))
         domain = self._combine_or_groups(groups)
         if brand_name:
-            brand_dom = self._brand_domain(brand_name)
+            brand_dom = self._brand_domain(brand_name, for_model='product.product')
             domain = (brand_dom + domain) if domain else brand_dom
         candidates = self.env['product.product']
         for lang in langs:
@@ -292,14 +318,14 @@ class PdfToQuoteWizard(models.TransientModel):
             # exact op variant
             dom = [('default_code', '=', c)]
             if brand_name:
-                dom = self._brand_domain(brand_name) + dom
+                dom = self._brand_domain(brand_name, for_model='product.product') + dom
             p = Product.with_context(**ctx).search(dom, limit=1)
             if p:
                 return p
             # ilike + client-normalisatie
             dom = [('default_code', 'ilike', c.replace(' ', '').replace('-', ''))]
             if brand_name:
-                dom = self._brand_domain(brand_name) + dom
+                dom = self._brand_domain(brand_name, for_model='product.product') + dom
             cand = Product.with_context(**ctx).search(dom, limit=200)
             for x in cand:
                 if _clean_code(x.default_code or '') == c_norm:
@@ -307,8 +333,8 @@ class PdfToQuoteWizard(models.TransientModel):
             # template-fallback
             dom = [('default_code', '=', c)]
             if brand_name:
-                dom = self._brand_domain(brand_name) + dom
-            t = Template.with_context(**ctx).search(dom, limit=1)
+                dom = self._brand_domain(brand_name, for_model='product.product') + dom
+            t = Template.with_context(**ctx).search((self._brand_domain(brand_name, for_model='product.template') + dom) if brand_name else dom, limit=1)
             if t:
                 p = Product.with_context(**ctx).search([('product_tmpl_id', '=', t.id)], limit=1)
                 if p:
