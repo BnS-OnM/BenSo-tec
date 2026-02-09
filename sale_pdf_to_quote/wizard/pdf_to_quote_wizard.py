@@ -311,7 +311,7 @@ class PdfToQuoteWizard(models.TransientModel):
                     best_name = p.display_name or p.name
 
             # als rapidfuzz ontbreekt, zet cutoff iets lager om difflib-striktheid te compenseren
-            cutoff = 80 if HAVE_RF else 70
+            cutoff = 78 if HAVE_RF else 68
             if best_score >= cutoff and best_product:
                 _logger.debug('Matched by fuzzy (%s%%): %s', best_score, best_name)
                 return (best_product, best_score, 'fuzzy', best_name)
@@ -389,9 +389,7 @@ class PdfToQuoteWizard(models.TransientModel):
             line_vals = {
                 'order_id': sale_order.id,
                 'product_id': product.id,
-                'product_uom_qty': line_data['qty'],
-                'product_uom': product.uom_id.id,
-                'name': line_data['desc'],
+                'product_uom_qty': line_data['qty'],                'name': line_data['desc'],
             }
             if line_data['price'] is not None:
                 line_vals['price_unit'] = line_data['price']
