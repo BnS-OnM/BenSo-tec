@@ -163,7 +163,8 @@ class PdfToQuoteWizard(models.TransientModel):
         patterns = [
             r'\bVR\d{2,4}\b',
             r'\bVRC\s*\d{2,4}\b',
-            r'\bVWL\s*\d+(?:\.\d+)?\s*[A-Z]{1,4}\b',
+            # VWL codes zoals "VWL 8.2 AS" of "VWL 75/8.2 IS" of "VWL 75/8.2 AS"
+            r'\bVWL\s*\d+(?:[./]\d+)?(?:\.\d+)?\s*[A-Z]{1,4}\b',
             r'\bVIH\s*[A-Z]{1,4}\b',
             r'\bVP\s*RW\s*\d+/\d+\s*[A-Z]\b',
         ]
@@ -209,10 +210,21 @@ class PdfToQuoteWizard(models.TransientModel):
         else:
             return SequenceMatcher(None, a, b).ratio() * 100
 
-    def _search_candidates(self, tokens, langs=("nl_BE", "en_US")):
-        """Zoek breed in product.product (varianten) met beide talen en incl. gearchiveerd."""
+    def _search_candidates(self, tokens, langs=("nl_BE", "en_US"), code_tokens=None):
+        """Zoek breed in product.product (varianten) met beide talen en incl. gearchiveerd.
+        Als code_tokens aanwezig zijn, gebruik die eerst als anker in het domein.
+        """
         Product = self.env['product.product']
         domain = []
+        # eerst anker op codes (naam, template-naam, default_code)
+        if code_tokens:
+            for ct in code_tokens:
+                domain = ['|', '|'] + domain + [
+                    ('name', 'ilike', ct),
+                    ('product_tmpl_id.name', 'ilike', ct),
+                    ('default_code', 'ilike', ct),
+                ]
+        # dan algemene tokens
         for t in tokens:
             domain = ['|', '|'] + domain + [
                 ('name', 'ilike', t),
@@ -220,10 +232,9 @@ class PdfToQuoteWizard(models.TransientModel):
                 ('default_code', 'ilike', t),
             ]
         candidates = self.env['product.product']
-        # merge results over talen
         for lang in langs:
             ctx = {'lang': lang, 'active_test': False}
-            res = Product.with_context(**ctx).search(domain or [], limit=400)
+            res = Product.with_context(**ctx).search(domain or [], limit=500)
             candidates |= res
         _logger.debug('Candidates found: %s', len(candidates))
         return candidates
@@ -243,7 +254,7 @@ class PdfToQuoteWizard(models.TransientModel):
             if p:
                 return p
             # ilike + client-side normalisatie
-            cand = Product.with_context(**ctx).search([('default_code', 'ilike', c.replace(' ', '').replace('-', ''))], limit=80)
+            cand = Product.with_context(**ctx).search([('default_code', 'ilike', c.replace(' ', '').replace('-', ''))], limit=120)
             for x in cand:
                 if _clean_code(x.default_code or '') == c_norm:
                     return x
@@ -256,10 +267,10 @@ class PdfToQuoteWizard(models.TransientModel):
         return None
 
     def _build_tokens(self, desc: str, codes_from_desc):
-        """Maak tokens voor domain search. Laat whitelisted korte prefixes (vr, vrc, vwl, vih, vp) toe.
-        Voeg ook codes uit de tekst toe zodat we op default_code kunnen zoeken.
+        """Maak tokens voor domain search. Laat whitelisted korte prefixes (vr, vrc, vwl, vih, vp, hb) toe.
+        Voeg ook codes uit de tekst toe zodat we op default_code/naam kunnen zoeken.
         """
-        raw = re.findall(r"[A-Za-z0-9]+", desc or '')
+        raw = re.findall(r"[A-Za-z0-9/\.]+", desc or '')
         tokens = []
         for t in raw:
             tl = t.lower()
@@ -276,13 +287,13 @@ class PdfToQuoteWizard(models.TransientModel):
         if not tokens and raw:
             raw_sorted = sorted(set(raw), key=len, reverse=True)
             tokens = [w.lower() for w in raw_sorted[:2]]
-        # deduplicate behouden volgorde
+        # deduplicate behoud volgorde
         seen = set()
         ordered = []
         for t in tokens:
             if t not in seen:
                 ordered.append(t); seen.add(t)
-        return ordered[:8]
+        return ordered[:10]
 
     def _match_product(self, code=None, desc=None):
         # 1) Code-first
@@ -291,27 +302,41 @@ class PdfToQuoteWizard(models.TransientModel):
             _logger.debug('Matched by code: %s', product.display_name)
             return (product, 100, 'code_exact', product.display_name)
 
-        # 2) Fuzzy op beschrijving
+        # 2) Fuzzy / code-in-naam op beschrijving
         if desc and len(desc) > 3:
-            # extraheer eventuele codes uit de beschrijving
             codes_from_desc = self._extract_product_codes(desc)
             tokens = self._build_tokens(desc, codes_from_desc)
-            candidates = self._search_candidates(tokens) if tokens else self._search_candidates([])
+            code_tokens_norm = [re.sub(r"\s+", "", c) for c in (codes_from_desc or [])]
+            candidates = self._search_candidates(tokens, code_tokens=code_tokens_norm)
 
+            # 2a) code in display_name/name hard-match
+            if codes_from_desc:
+                for p in candidates:
+                    label = (p.display_name or p.name or '')
+                    label_norm = re.sub(r"[\s\-.]", "", label).upper()
+                    for c in codes_from_desc:
+                        c_norm = re.sub(r"\s+", "", c).upper()
+                        if c_norm and c_norm in label_norm:
+                            _logger.debug('Matched by code-in-name: %s contains %s', label, c)
+                            return (p, 96, 'code_in_name', label)
+
+            # 2b) Fuzzy op beschrijving
             best_score = 0
             best_product = None
             best_name = None
             desc_for_match = _clean_desc_for_match(desc)
 
+            scores = []
             for p in candidates:
-                score = self._fuzzy_match_score(desc_for_match, p.display_name or p.name or '')
+                label = p.display_name or p.name or ''
+                score = self._fuzzy_match_score(desc_for_match, label)
+                scores.append((score, p, label))
                 if score > best_score:
                     best_score = score
                     best_product = p
-                    best_name = p.display_name or p.name
+                    best_name = label
 
-            # als rapidfuzz ontbreekt, zet cutoff iets lager om difflib-striktheid te compenseren
-            cutoff = 78 if HAVE_RF else 68
+            cutoff = 75 if HAVE_RF else 68
             if best_score >= cutoff and best_product:
                 _logger.debug('Matched by fuzzy (%s%%): %s', best_score, best_name)
                 return (best_product, best_score, 'fuzzy', best_name)
@@ -389,7 +414,8 @@ class PdfToQuoteWizard(models.TransientModel):
             line_vals = {
                 'order_id': sale_order.id,
                 'product_id': product.id,
-                'product_uom_qty': line_data['qty'],                'name': line_data['desc'],
+                'product_uom_qty': line_data['qty'],
+                'name': line_data['desc'],
             }
             if line_data['price'] is not None:
                 line_vals['price_unit'] = line_data['price']
