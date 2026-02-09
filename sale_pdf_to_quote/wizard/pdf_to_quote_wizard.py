@@ -62,6 +62,8 @@ class PdfToQuoteWizard(models.TransientModel):
     partner_id = fields.Many2one('res.partner', string='Customer', required=True)
     use_pdf_prices = fields.Boolean(string='Use PDF Prices', default=True)
     name_prefix = fields.Char(string='Reference Prefix', default='GPT-001')
+    add_suggestions = fields.Boolean(string='Add candidate suggestions when uncertain', default=True,
+                                     help='If enabled, when a schema item cannot be matched with enough confidence, the wizard will add multiple likely products as suggestions.')
 
     # Result fields
     sale_order_id = fields.Many2one('sale.order', string='Created Quotation', readonly=True)
@@ -163,7 +165,7 @@ class PdfToQuoteWizard(models.TransientModel):
         patterns = [
             r'\bVR\d{2,4}\b',
             r'\bVRC\s*\d{2,4}\b',
-            # VWL codes zoals "VWL 8.2 AS" of "VWL 75/8.2 IS" of "VWL 75/8.2 AS"
+            # VWL codes zoals "VWL 8.2 AS", "VWL 75/8.2 IS" of "VWL 75/8.2 AS"
             r'\bVWL\s*\d+(?:[./]\d+)?(?:\.\d+)?\s*[A-Z]{1,4}\b',
             r'\bVIH\s*[A-Z]{1,4}\b',
             r'\bVP\s*RW\s*\d+/\d+\s*[A-Z]\b',
@@ -200,6 +202,15 @@ class PdfToQuoteWizard(models.TransientModel):
         _logger.info('Parsed %s items from table format', len(items))
         return items
 
+    # ---------------- Domain helpers ----------------
+
+    def _token_group_domain(self, token):
+        """OR over name, product_tmpl_id.name en default_code voor één token."""
+        return ['|', '|',
+                ('name', 'ilike', token),
+                ('product_tmpl_id.name', 'ilike', token),
+                ('default_code', 'ilike', token)]
+
     # ---------------- Matching ----------------
 
     def _fuzzy_match_score(self, str1, str2):
@@ -211,30 +222,30 @@ class PdfToQuoteWizard(models.TransientModel):
             return SequenceMatcher(None, a, b).ratio() * 100
 
     def _search_candidates(self, tokens, langs=("nl_BE", "en_US"), code_tokens=None):
-        """Zoek breed in product.product (varianten) met beide talen en incl. gearchiveerd.
-        Als code_tokens aanwezig zijn, gebruik die eerst als anker in het domein.
+        """Zoek breed in product.product (varianten), incl. gearchiveerd, in NL + EN.
+        Eerst per code-token een OR-groep, daarna per gewone token een OR-groep. Groepen zelf worden met OR gecombineerd.
         """
         Product = self.env['product.product']
+        groups = []
+        # 1) code-token-gebaseerde groepen
+        for ct in (code_tokens or []):
+            if ct:
+                groups.append(self._token_group_domain(ct))
+        # 2) gewone token-groepen
+        for t in (tokens or []):
+            groups.append(self._token_group_domain(t))
+        # Combineer alle groepen met OR
         domain = []
-        # eerst anker op codes (naam, template-naam, default_code)
-        if code_tokens:
-            for ct in code_tokens:
-                domain = ['|', '|'] + domain + [
-                    ('name', 'ilike', ct),
-                    ('product_tmpl_id.name', 'ilike', ct),
-                    ('default_code', 'ilike', ct),
-                ]
-        # dan algemene tokens
-        for t in tokens:
-            domain = ['|', '|'] + domain + [
-                ('name', 'ilike', t),
-                ('product_tmpl_id.name', 'ilike', t),
-                ('default_code', 'ilike', t),
-            ]
+        for i, grp in enumerate(groups):
+            if i == 0:
+                domain = grp
+            else:
+                domain = ['|'] + domain + grp
+
         candidates = self.env['product.product']
         for lang in langs:
             ctx = {'lang': lang, 'active_test': False}
-            res = Product.with_context(**ctx).search(domain or [], limit=500)
+            res = Product.with_context(**ctx).search(domain or [], limit=800)
             candidates |= res
         _logger.debug('Candidates found: %s', len(candidates))
         return candidates
@@ -254,7 +265,7 @@ class PdfToQuoteWizard(models.TransientModel):
             if p:
                 return p
             # ilike + client-side normalisatie
-            cand = Product.with_context(**ctx).search([('default_code', 'ilike', c.replace(' ', '').replace('-', ''))], limit=120)
+            cand = Product.with_context(**ctx).search([('default_code', 'ilike', c.replace(' ', '').replace('-', ''))], limit=200)
             for x in cand:
                 if _clean_code(x.default_code or '') == c_norm:
                     return x
@@ -295,6 +306,83 @@ class PdfToQuoteWizard(models.TransientModel):
                 ordered.append(t); seen.add(t)
         return ordered[:10]
 
+    def _extract_core_features(self, desc: str):
+        """Haal kernfeatures uit omschrijving (familie, debiet/maat, variant).
+        Voorbeelden die we willen afvangen:
+        - Hydraulic/Hydraulische module VWL 8.2 IS
+        - ... VWL 75/8.2 AS
+        """
+        text = _norm_text(desc)
+        features = {
+            'family': None,
+            'size': None,   # bijv. '8.2'
+            'variant': None # 'is' of 'as'
+        }
+        if 'vwl' in text:
+            features['family'] = 'vwl'
+        # variant
+        if re.search(r'\bis\b', text):
+            features['variant'] = 'is'
+        elif re.search(r'\bas\b', text):
+            features['variant'] = 'as'
+        # size: pak eerste decimaal/cijfergroep die logisch is (8.2, 6.5, 75/8.2 etc.)
+        m = re.search(r'(\d{1,3}(?:[./]\d{1,2})?(?:\.\d{1,2})?)', text)
+        if m:
+            # normaliseer naar punt
+            size = m.group(1).replace(',', '.').replace('/', '/').strip()
+            features['size'] = size
+        return features
+
+    def _suggest_products(self, desc: str, qty: float):
+        """Zoek en retourneer meerdere plausibele kandidaten wanneer een schema-item te weinig context heeft.
+        Strategie: familie (VWL) + size (8.2) + variant (IS/AS) + 'hydra' (voor hydrauli* varianten).
+        """
+        feats = self._extract_core_features(desc)
+        tokens_and = []
+
+        text = _norm_text(desc)
+        # basis: hydra-woord om Hydraulisch/Hydraulic te pakken
+        if 'hydra' in text:
+            tokens_and.append('hydra')
+        # familie
+        if feats.get('family'):
+            tokens_and.append(feats['family'])
+        # size aanwezig? voeg zowel met punt als met komma toe als token
+        if feats.get('size'):
+            s = feats['size']
+            tokens_and.append(s.replace(',', '.'))
+            tokens_and.append(s.replace('.', ','))
+        # variant
+        if feats.get('variant'):
+            tokens_and.append(feats['variant'])
+
+        # bouw AND-domain (alle tokens moeten ergens voorkomen) als reeks van OR-groepen die we sequentieel AND'en
+        Product = self.env['product.product']
+        # start set is leeg, we bouwen incrementieel
+        current = Product.with_context(lang='nl_BE', active_test=False).search([], limit=0)
+        # sequentieel AND'en door telkens te filteren op de vorige set
+        current_ids = False
+        for token in tokens_and:
+            group_domain = ['|', '|', ('name', 'ilike', token), ('product_tmpl_id.name', 'ilike', token), ('default_code', 'ilike', token)]
+            step_domain = [('id', 'in', current_ids)] + group_domain if current_ids else group_domain
+            step = Product.with_context(lang='nl_BE', active_test=False).search(step_domain, limit=1000)
+            step |= Product.with_context(lang='en_US', active_test=False).search(step_domain, limit=1000)
+            current_ids = step.ids
+            if not current_ids:
+                break
+        if not current_ids:
+            return []
+        # score en sorteer top 3
+        scored = []
+        desc_for_match = _clean_desc_for_match(desc)
+        for p in Product.browse(current_ids):
+            label = p.display_name or p.name or ''
+            score = self._fuzzy_match_score(desc_for_match, label)
+            scored.append((score, p))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        suggestions = [(p, int(score)) for score, p in scored[:3]]
+        return suggestions
+
     def _match_product(self, code=None, desc=None):
         # 1) Code-first
         product = self._match_by_code(code)
@@ -306,13 +394,13 @@ class PdfToQuoteWizard(models.TransientModel):
         if desc and len(desc) > 3:
             codes_from_desc = self._extract_product_codes(desc)
             tokens = self._build_tokens(desc, codes_from_desc)
-            code_tokens_norm = [re.sub(r"\s+", "", c) for c in (codes_from_desc or [])]
-            candidates = self._search_candidates(tokens, code_tokens=code_tokens_norm)
+            # bouw candidate set via OR-groepen
+            candidates = self._search_candidates(tokens, code_tokens=[re.sub(r"\s+", "", c) for c in (codes_from_desc or [])])
 
             # 2a) code in display_name/name hard-match
             if codes_from_desc:
                 for p in candidates:
-                    label = (p.display_name or p.name or '')
+                    label = p.display_name or p.name or ''
                     label_norm = re.sub(r"[\s\-.]", "", label).upper()
                     for c in codes_from_desc:
                         c_norm = re.sub(r"\s+", "", c).upper()
@@ -326,11 +414,9 @@ class PdfToQuoteWizard(models.TransientModel):
             best_name = None
             desc_for_match = _clean_desc_for_match(desc)
 
-            scores = []
             for p in candidates:
                 label = p.display_name or p.name or ''
                 score = self._fuzzy_match_score(desc_for_match, label)
-                scores.append((score, p, label))
                 if score > best_score:
                     best_score = score
                     best_product = p
@@ -367,6 +453,7 @@ class PdfToQuoteWizard(models.TransientModel):
         matched_lines = []
         unmatched_items = []
         products_dict = {}
+        suggestions_added = []
 
         for item in parsed_items:
             if pdf_type == 'table':
@@ -395,6 +482,25 @@ class PdfToQuoteWizard(models.TransientModel):
                     }
                 matched_lines.append(item)
             else:
+                # Geen match: voor schema's kunnen we suggesties toevoegen
+                if self.add_suggestions and pdf_type == 'bottom_bar' and desc:
+                    suggs = self._suggest_products(desc, qty)
+                    if suggs:
+                        for p, s in suggs:
+                            if p.id in products_dict:
+                                products_dict[p.id]['qty'] += qty
+                            else:
+                                products_dict[p.id] = {
+                                    'qty': qty,
+                                    'price': None,
+                                    'desc': f"[SUGGESTIE] {desc}",
+                                    'product': p,
+                                }
+                            suggestions_added.append((desc, p.display_name or p.name, s))
+                        # we beschouwen dit item als 'gematched via suggesties'
+                        matched_lines.append(item)
+                        continue
+                # Anders unmatched registreren
                 unmatched_items.append({
                     'raw': f"Code: {code}, Desc: {desc}, Qty: {qty}",
                     'score': score,
@@ -422,13 +528,18 @@ class PdfToQuoteWizard(models.TransientModel):
             self.env['sale.order.line'].create(line_vals)
 
         unmatched_text = ''
+        blocks = []
+        if suggestions_added:
+            lines = [f"• {src} → {dst} (score {sc}%)" for src, dst, sc in suggestions_added]
+            blocks.append("Voorgestelde producten toegevoegd (onzekere matches):\n" + "\n".join(lines))
         if unmatched_items:
-            chunks = []
+            lines = []
             for item in unmatched_items:
-                chunks.append(
+                lines.append(
                     f"• {item['raw']}\n  Best candidate: {item['candidate']} (score: {item['score']:.1f}%)\n"
                 )
-            unmatched_text = '\n'.join(chunks)
+            blocks.append("Niet-gematchte items:\n" + "\n".join(lines))
+        unmatched_text = "\n\n".join(blocks)
 
         self.write({
             'sale_order_id': sale_order.id,
@@ -438,7 +549,7 @@ class PdfToQuoteWizard(models.TransientModel):
             'state': 'done',
         })
 
-        _logger.info('Created sale order %s: %s matched, %s unmatched', sale_order.name, len(matched_lines), len(unmatched_items))
+        _logger.info('Created sale order %s: %s matched (incl. suggestions), %s unmatched', sale_order.name, len(matched_lines), len(unmatched_items))
 
         return {
             'type': 'ir.actions.act_window',
