@@ -6,7 +6,7 @@
         <field name="arch" type="xml">
             <form string="Import PDF to Quotation">
                 <group>
-                    <group name="input_fields" attrs="{'invisible': [('state', '=', 'done')]}">
+                    <group name="input_fields" invisible="state == 'done'">
                         <field name="state" invisible="1"/>
                         <field name="pdf_file" filename="filename" widget="binary"/>
                         <field name="filename" invisible="1"/>
@@ -15,15 +15,15 @@
                         <field name="name_prefix"/>
                     </group>
                     
-                    <group name="result_fields" attrs="{'invisible': [('state', '!=', 'done')]}">
+                    <group name="result_fields" invisible="state != 'done'">
                         <field name="sale_order_id" readonly="1"/>
                         <field name="matched_count" readonly="1"/>
                         <field name="unmatched_count" readonly="1"/>
                     </group>
                 </group>
                 
-                <notebook attrs="{'invisible': [('state', '!=', 'done')]}">
-                    <page string="Unmatched Items" attrs="{'invisible': [('unmatched_count', '=', 0)]}">
+                <notebook invisible="state != 'done'">
+                    <page string="Unmatched Items" invisible="unmatched_count == 0">
                         <field name="unmatched_text" readonly="1" nolabel="1"/>
                     </page>
                 </notebook>
@@ -33,7 +33,7 @@
                             string="Maak offerte" 
                             type="object" 
                             class="btn-primary"
-                            attrs="{'invisible': [('state', '=', 'done')]}"/>
+                            invisible="state == 'done'"/>
                     <button string="Close" class="btn-secondary" special="cancel"/>
                 </footer>
             </form>
