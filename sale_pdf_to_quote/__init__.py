@@ -1,1 +1,1 @@
-from . import pdf_to_quote_wizard
+from . import wizard
