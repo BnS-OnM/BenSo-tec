@@ -12,7 +12,7 @@ _logger = logging.getLogger(__name__)
 try:
     import PyPDF2
 except ImportError:
-    _logger.warning('PyPDF2 library is not installed. PDF parsing will not work.')
+    _logger.warning('PyPDF2 is deprecated; install pypdf if needed. Using PyPDF2 if present.')
     PyPDF2 = None
 
 # Try to import rapidfuzz, fallback to difflib
