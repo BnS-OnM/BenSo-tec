@@ -221,6 +221,42 @@ class PdfToQuoteWizard(models.TransientModel):
         _logger.info("Parsed %s items from table format", len(items))
         return items
 
+    # ---------------- Schema helpers (NEW) ----------------
+
+    def _extract_core_value(self, s: str):
+        """
+        Extract value like '8.2' from text. Accepts '8.2' or '8,2'.
+        Returns normalized string with dot: '8.2' or None.
+        """
+        if not s:
+            return None
+        s2 = (s or "").replace(",", ".")
+        m = re.search(r"\b(\d{1,2}\.\d)\b", s2)
+        if m:
+            return m.group(1)
+        return None
+
+    def _detect_core_value_from_schema_pdf(self, text: str, parsed_items: list):
+        """
+        Try to find core value (like 8.2) from lines containing arotherm (preferred),
+        else from appliances/controls items.
+        """
+        # 1) Prefer lines containing "arotherm"
+        for line in (text or "").split("\n"):
+            if "arotherm" in _norm_text(line):
+                v = self._extract_core_value(line)
+                if v:
+                    return v
+
+        # 2) Fallback: scan parsed items
+        for it in parsed_items or []:
+            v = self._extract_core_value(it.get("desc", ""))
+            if v:
+                return v
+
+        # 3) last resort: scan full text
+        return self._extract_core_value(text or "")
+
     # ---------------- Matching helpers ----------------
 
     def _fuzzy_score(self, a: str, b: str) -> float:
@@ -431,21 +467,38 @@ class PdfToQuoteWizard(models.TransientModel):
         unmatched_items = []
         products_dict = {}
 
-        # --------- Schema (bottom_bar): add all products matching detected series across entire text ---------
+        # --------- Schema (bottom_bar): add all products matching detected series AND core value (e.g. 8.2) ---------
         done_by_series = False
         if pdf_type == "bottom_bar":
             series = self._detect_series_from_text(text)
+            core_value = self._detect_core_value_from_schema_pdf(text, parsed_items)
+
             _logger.info("Schema series detected in PDF text: %s", ", ".join(sorted(series)) if series else "—")
+            _logger.info("Schema core value detected: %s", core_value or "—")
 
             if series:
                 Product = self.env["product.product"].with_context(active_test=False)
+
+                # Base domain from series tokens
                 groups = [self._token_group(s) for s in series]
                 domain = self._combine_or_groups(groups)
+
+                # Optional brand filter
                 if brand_name:
                     domain = self._brand_domain(brand_name, "product.product") + (domain or [])
 
+                # NEW: core value filter (only products containing 8.2 in name)
+                if core_value:
+                    domain = (domain or []) + [("name", "ilike", core_value)]
+
                 found = Product.search(domain or [], limit=5000)
-                _logger.info("Schema series search found %s products", len(found))
+
+                # Extra safety filter (handles commas, display_name vs name)
+                if core_value:
+                    cv = core_value.replace(",", ".")
+                    found = found.filtered(lambda p: cv in ((p.display_name or p.name or "").replace(",", ".")))
+
+                _logger.info("Schema series+core search found %s products", len(found))
 
                 if found:
                     for p in found:
@@ -460,10 +513,10 @@ class PdfToQuoteWizard(models.TransientModel):
                     done_by_series = True
                 else:
                     unmatched_items.append({
-                        "raw": f"Series: {', '.join(sorted(series))}",
+                        "raw": f"Series: {', '.join(sorted(series))} | core={core_value or '—'}",
                         "score": 0,
                         "candidate": "—",
-                        "method": "series_search_empty",
+                        "method": "series_core_search_empty",
                     })
             else:
                 unmatched_items.append({
