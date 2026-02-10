@@ -6,7 +6,9 @@
         <field name="arch" type="xml">
             <form string="PDF to Quotation">
                 <sheet>
-                    <group>
+
+                    <!-- INPUT -->
+                    <group invisible="state == 'done'">
                         <group string="Input">
                             <field name="pdf_file" filename="filename"/>
                             <field name="filename"/>
@@ -17,22 +19,12 @@
 
                         <group string="Optional filters">
                             <field name="restrict_to_brand"/>
-                            <field name="brand_filter"
-                                   attrs="{'invisible':[('restrict_to_brand','=',False)]}"/>
+                            <field name="brand_filter" invisible="not restrict_to_brand"/>
                         </group>
                     </group>
 
-                    <footer>
-                        <button name="action_create_quotation"
-                                string="Create Quotation"
-                                type="object"
-                                class="btn-primary"
-                                attrs="{'invisible':[('state','=','done')]}"/>
-                        <button string="Close" class="btn-secondary" special="cancel"
-                                attrs="{'invisible':[('state','=','done')]}"/>
-                    </footer>
-
-                    <group attrs="{'invisible':[('state','!=','done')]}">
+                    <!-- RESULT -->
+                    <group invisible="state != 'done'">
                         <group string="Result">
                             <field name="sale_order_id" readonly="1"/>
                             <field name="matched_count" readonly="1"/>
@@ -44,6 +36,18 @@
                     </group>
 
                 </sheet>
+
+                <footer>
+                    <button name="action_create_quotation"
+                            string="Create Quotation"
+                            type="object"
+                            class="btn-primary"
+                            invisible="state == 'done'"/>
+                    <button string="Close"
+                            class="btn-secondary"
+                            special="cancel"
+                            invisible="state == 'done'"/>
+                </footer>
             </form>
         </field>
     </record>
