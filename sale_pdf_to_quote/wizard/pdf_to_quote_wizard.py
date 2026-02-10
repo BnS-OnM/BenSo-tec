@@ -50,12 +50,10 @@ def _clean_code(c: str) -> str:
 
 # korte product-prefixen die we NIET willen wegfilteren, ook al zijn ze 2-3 letters
 WHITELIST_PREFIXES = {"vr", "vrc", "vwl", "vih", "vp", "hb"}
-WHITELIST_SUFFIXES = {"is", "as", "s1"}
+SUFFIX_WHITELIST = {"is", "as", "s1"}
 
 # Specifieke Studio-veldnaam waar het merk in staat (Char property)
 BRAND_PROP_FIELD = 'product_properties.8b621cac637a8a24'
-
-FAMILY_TOKENS = ("vwl", "vrc", "vr", "vih", "vp")
 
 
 class PdfToQuoteWizard(models.TransientModel):
@@ -69,7 +67,7 @@ class PdfToQuoteWizard(models.TransientModel):
     use_pdf_prices = fields.Boolean(string='Use PDF Prices', default=True)
     name_prefix = fields.Char(string='Reference Prefix', default='GPT-001')
 
-    # Merkfilter (optioneel)
+    # Merkfilter (versnelt zoeken en vermindert ruis)
     restrict_to_brand = fields.Boolean(
         string='Limit search to brand', default=False,
         help='Restrict search to a brand using the product template field "%s".' % BRAND_PROP_FIELD
@@ -121,6 +119,7 @@ class PdfToQuoteWizard(models.TransientModel):
         table_pattern = re.compile(r'^\*?\d{5,}\s+\d+\s+', re.MULTILINE)
         has_table_pattern = len(table_pattern.findall(text)) > 2
 
+        # case-insensitive checks
         has_appliances = 'appliances:' in text_lower
         has_controls = 'controls:' in text_lower
 
@@ -225,21 +224,25 @@ class PdfToQuoteWizard(models.TransientModel):
         """
         if not brand_name:
             return []
+        # find all Studio property fields
         T = self.env['product.template']
         prop_fields = [fname for fname in T._fields.keys() if fname.startswith('product_properties.')]
         domain_options = []
         if for_model == 'product.product':
+            # prefix through product_tmpl_id
             for fld in prop_fields:
                 domain_options.append((f'product_tmpl_id.{fld}', 'ilike', brand_name))
-        else:
+        else:  # product.template context
             for fld in prop_fields:
                 domain_options.append((fld, 'ilike', brand_name))
+        # if no studio fields found, fall back softly to name
         if not domain_options:
             if for_model == 'product.product':
                 domain_options.append(('name', 'ilike', brand_name))
                 domain_options.append(('product_tmpl_id.name', 'ilike', brand_name))
             else:
                 domain_options.append(('name', 'ilike', brand_name))
+        # combine OR chain
         domain = domain_options[0]
         for cond in domain_options[1:]:
             domain = ['|'] + list(domain) + list(cond)
@@ -270,31 +273,38 @@ class PdfToQuoteWizard(models.TransientModel):
         else:
             return SequenceMatcher(None, a, b).ratio() * 100
 
+    def _combine_or_groups(self, groups):
+        """Combineer OR-groepen correct volgens Odoo-domein.
+        Elke groep is al een OR over (name|tmpl.name|default_code) voor één token.
+        """
+        if not groups:
+            return []
+        domain = groups[0]
+        for grp in groups[1:]:
+            domain = ['|'] + domain + grp
+        return domain
+
+    def _token_group(self, token):
+        return ['|', '|', ('name', 'ilike', token), ('product_tmpl_id.name', 'ilike', token), ('default_code', 'ilike', token)]
+
     def _search_candidates(self, tokens, langs=("nl_BE", "en_US"), code_tokens=None, brand_name=None):
-        """Voer kleinere per-token queries uit en unieer de resultaten.
-        Dit vermijdt een gigantische OR-domain (performanter en minder kans op timeouts)."""
+        """Zoek breed in product.product, met optionele merklimiet en correcte OR-opbouw."""
         Product = self.env['product.product']
+        groups = []
+        for ct in (code_tokens or []):
+            groups.append(self._token_group(ct))
+        for t in (tokens or []):
+            groups.append(self._token_group(t))
+        domain = self._combine_or_groups(groups)
+        if brand_name:
+            brand_dom = self._brand_domain(brand_name, for_model='product.product')
+            domain = (brand_dom + domain) if domain else brand_dom
         candidates = self.env['product.product']
-
-        brand_dom_product = self._brand_domain(brand_name, for_model='product.product') if brand_name else []
-        tok_list = list(tokens or [])[:8]
-        code_tok_list = list(code_tokens or [])[:4]
-
-        def token_domain(tok):
-            return ['|', '|', ('name', 'ilike', tok), ('product_tmpl_id.name', 'ilike', tok), ('default_code', 'ilike', tok)]
-
-        per_token_limit = 200
         for lang in langs:
             ctx = {'lang': lang, 'active_test': False}
-            for ct in code_tok_list:
-                dom = (brand_dom_product + token_domain(ct)) if brand_dom_product else token_domain(ct)
-                res = Product.with_context(**ctx).search(dom, limit=per_token_limit)
-                candidates |= res
-            for t in tok_list:
-                dom = (brand_dom_product + token_domain(t)) if brand_dom_product else token_domain(t)
-                res = Product.with_context(**ctx).search(dom, limit=per_token_limit)
-                candidates |= res
-        _logger.debug('Candidates (union) found: %s (brand=%s)', len(candidates), brand_name)
+            res = Product.with_context(**ctx).search(domain or [], limit=400)
+            candidates |= res
+        _logger.debug('Candidates found: %s (brand=%s)', len(candidates), brand_name)
         return candidates
 
     def _match_by_code(self, code, brand_name=None):
@@ -306,12 +316,14 @@ class PdfToQuoteWizard(models.TransientModel):
         codes_to_try = code if isinstance(code, list) else [code]
         for c in codes_to_try:
             c_norm = _clean_code(c)
+            # exact op variant
             dom = [('default_code', '=', c)]
             if brand_name:
                 dom = self._brand_domain(brand_name, for_model='product.product') + dom
             p = Product.with_context(**ctx).search(dom, limit=1)
             if p:
                 return p
+            # ilike + client-normalisatie
             dom = [('default_code', 'ilike', c.replace(' ', '').replace('-', ''))]
             if brand_name:
                 dom = self._brand_domain(brand_name, for_model='product.product') + dom
@@ -319,10 +331,11 @@ class PdfToQuoteWizard(models.TransientModel):
             for x in cand:
                 if _clean_code(x.default_code or '') == c_norm:
                     return x
-            t_dom = [('default_code', '=', c)]
+            # template-fallback
+            dom = [('default_code', '=', c)]
             if brand_name:
-                t_dom = self._brand_domain(brand_name, for_model='product.template') + t_dom
-            t = Template.with_context(**ctx).search(t_dom, limit=1)
+                dom = self._brand_domain(brand_name, for_model='product.product') + dom
+            t = Template.with_context(**ctx).search((self._brand_domain(brand_name, for_model='product.template') + dom) if brand_name else dom, limit=1)
             if t:
                 p = Product.with_context(**ctx).search([('product_tmpl_id', '=', t.id)], limit=1)
                 if p:
@@ -337,7 +350,7 @@ class PdfToQuoteWizard(models.TransientModel):
             if tl in WHITELIST_PREFIXES:
                 tokens.append(tl)
                 continue
-            if tl in WHITELIST_SUFFIXES or (len(tl) > 2 and not tl.isdigit()):
+            if tl in SUFFIX_WHITELIST or (len(tl) > 2 and not tl.isdigit()):
                 tokens.append(tl)
         for c in (codes_from_desc or []):
             if c:
@@ -351,93 +364,67 @@ class PdfToQuoteWizard(models.TransientModel):
                 ordered.append(t); seen.add(t)
         return ordered[:10]
 
-    def _rank_candidates(self, desc, candidates):
-        if not candidates:
-            return []
-        desc_clean = _clean_desc_for_match(desc)
-        fams = [f for f in FAMILY_TOKENS if re.search(rf'\b{re.escape(f)}\b', _norm_text(desc))]
-        size_match = re.search(r"\b\d{1,3}(?:[./]\d{1,2})?(?:\.\d{1,2})?\b", _norm_text(desc))
-        size = size_match.group(0) if size_match else None
-        scored = []
-        for p in candidates:
-            label = p.display_name or p.name or ''
-            s = self._fuzzy_match_score(desc_clean, label)
-            label_n = _norm_text(label)
-            for f in fams:
-                if re.search(rf'\b{re.escape(f)}\b', label_n):
-                    s += 5; break
-            if size and size.replace(',', '.') in label_n:
-                s += 5
-            scored.append((s, p, label))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[:3]
-
     def _match_product(self, code=None, desc=None, brand_name=None, schema_mode=False):
+        # 1) Code-first (met merklimiet)
         product = self._match_by_code(code, brand_name=brand_name)
         if product:
             _logger.debug('Matched by code (brand=%s): %s', brand_name, product.display_name)
             return (product, 100, 'code_exact', product.display_name)
 
+        # 2) Fuzzy / code-in-naam op beschrijving
         if desc and len(desc) > 3:
             codes_from_desc = self._extract_product_codes(desc)
             tokens = self._build_tokens(desc, codes_from_desc)
 
-            # Schema-modus: familie OF maat is voldoende (voorheen beide). Voeg maat-varianten toe.
+            # In schema-mode strenger: familie + maat verplicht (vb. VWL + 8.2)
             if schema_mode:
                 text = _norm_text(desc)
-                has_family = any(tok in tokens for tok in FAMILY_TOKENS)
+                has_family = any(tok in tokens for tok in ('vwl', 'vrc', 'vr', 'vih', 'vp'))
                 size_match = re.search(r"\b\d{1,3}(?:[./]\d{1,2})?(?:\.\d{1,2})?\b", text)
-                if not (has_family or size_match):
+                if not (has_family and size_match):
                     return (None, 0, 'schema_too_vague', None)
-                fam = next((t for t in tokens if t in FAMILY_TOKENS), None)
-                if fam:
-                    tokens = [t for t in tokens if t != fam]
-                    tokens.insert(0, fam)
+                if 'vwl' in tokens:
+                    tokens = [t for t in tokens if t != 'vwl']
+                    tokens.insert(0, 'vwl')
                 if size_match:
                     size_tok = size_match.group(0)
-                    size_dot = size_tok.replace(',', '.')
-                    size_com = size_dot.replace('.', ',')
-                    for v in {size_tok, size_dot, size_com}:
-                        if v not in tokens:
-                            tokens.insert(0, v)
-                    m = re.match(r"^(\d{1,3})[\/ ](\d{1,2})(?:[.,](\d{1,2}))?$", size_dot)
-                    if m:
-                        A, B, C = m.group(1), m.group(2), m.group(3)
-                        if C:
-                            for v in {f"{A}{B}{C}", f"{A} {B}.{C}", f"{A} {B},{C}"}:
-                                if v not in tokens:
-                                    tokens.append(v)
-                    else:
-                        m2 = re.match(r"^(\d{1,2})[.,](\d{1,2})$", size_dot)
-                        if m2:
-                            X, Y = m2.group(1), m2.group(2)
-                            flat = f"{X}{Y}"
-                            if flat not in tokens:
-                                tokens.append(flat)
+                    tokens.insert(0, size_tok.replace(',', '.'))
 
             code_tokens_norm = [re.sub(r"\s+", "", c) for c in (codes_from_desc or [])]
             candidates = self._search_candidates(tokens, code_tokens=code_tokens_norm, brand_name=brand_name)
 
-            # code in display_name/name hard-match
+            # 2a) code in display_name/name hard-match
             if codes_from_desc:
                 for p in candidates:
                     label = (p.display_name or p.name or '')
-                    label_norm = re.sub(r"[\s\-\.\/]", "", label).upper()
+                    label_norm = re.sub(r"[\s\-.]", "", label).upper()
                     for c in codes_from_desc:
-                        c_norm = re.sub(r"[\s\/]", "", c).upper()
+                        c_norm = re.sub(r"\s+", "", c).upper()
                         if c_norm and c_norm in label_norm:
                             _logger.debug('Matched by code-in-name (brand=%s): %s contains %s', brand_name, label, c)
                             return (p, 96, 'code_in_name', label)
 
-            top3 = self._rank_candidates(desc, candidates)
-            if top3:
-                best_score, best_product, best_name = top3[0]
-                cutoff = (74 if schema_mode else 75) if HAVE_RF else (66 if schema_mode else 68)
-                if best_score >= cutoff:
-                    _logger.debug('Matched by fuzzy (%s%%) (brand=%s): %s', best_score, brand_name, best_name)
-                    return (best_product, best_score, 'fuzzy', best_name)
-                else:
-                    return (None, best_score, 'fuzzy_failed', best_name)
+            # 2b) Fuzzy op beschrijving (cutoff strenger in schema-mode)
+            best_score = 0
+            best_product = None
+            best_name = None
+            desc_for_match = _clean_desc_for_match(desc)
+
+            for p in candidates:
+                label = p.display_name or p.name or ''
+                score = self._fuzzy_match_score(desc_for_match, label)
+                if score > best_score:
+                    best_score = score
+                    best_product = p
+                    best_name = label
+
+            cutoff = (80 if schema_mode else 75) if HAVE_RF else (72 if schema_mode else 68)
+            if best_score >= cutoff and best_product:
+                _logger.debug('Matched by fuzzy (%s%%) (brand=%s): %s', best_score, brand_name, best_name)
+                return (best_product, best_score, 'fuzzy', best_name)
+            elif best_product:
+                _logger.debug('Best fuzzy match (%s%%) below threshold (brand=%s): %s', best_score, brand_name, best_name)
+                return (None, best_score, 'fuzzy_failed', best_name)
 
         return (None, 0, None, None)
 
@@ -454,6 +441,7 @@ class PdfToQuoteWizard(models.TransientModel):
         text = self._extract_text_from_pdf(pdf_bytes)
         pdf_type = self._detect_pdf_type(text)
 
+        # Merk bepalen
         brand_name = None
         if self.restrict_to_brand:
             brand_name = (self.brand_filter or '').strip() or self._auto_detect_brand(text)
@@ -504,17 +492,11 @@ class PdfToQuoteWizard(models.TransientModel):
                     }
                 matched_lines.append(item)
             else:
-                # toon wat diagnose info (top3)
-                cand = self._search_candidates(self._build_tokens(desc or '', self._extract_product_codes(desc or '')),
-                                               code_tokens=None, brand_name=brand_name)
-                tmp_top3 = self._rank_candidates(desc or '', cand)[:3]
-                top3_txt = " / ".join([f"{int(s)}%: {n}" for s, _p, n in tmp_top3]) if tmp_top3 else '—'
                 unmatched_items.append({
                     'raw': f"Code: {code}, Desc: {desc}, Qty: {qty}",
                     'score': score,
                     'candidate': candidate_name or 'No candidate found',
                     'method': method or 'no_match',
-                    'top3_txt': top3_txt,
                 })
 
         order_vals = {
@@ -530,7 +512,7 @@ class PdfToQuoteWizard(models.TransientModel):
                 'order_id': sale_order.id,
                 'product_id': product.id,
                 'product_uom_qty': line_data['qty'],
-                'name': line_data['desc'],
+                'name': (product.get_product_multiline_description_sale() if hasattr(product, 'get_product_multiline_description_sale') else (product.display_name or product.name)),
             }
             if line_data['price'] is not None:
                 line_vals['price_unit'] = line_data['price']
@@ -543,7 +525,7 @@ class PdfToQuoteWizard(models.TransientModel):
                 chunks.append(f"Brand filter via {BRAND_PROP_FIELD}: {brand_name}")
             for item in unmatched_items:
                 chunks.append(
-                    f"• {item['raw']}\n  Best candidate: {item['candidate']} (score: {item['score']:.1f}%)\n  Top3: {item['top3_txt']}"
+                    f"• {item['raw']}\n  Best candidate: {item['candidate']} (score: {item['score']:.1f}%)"
                 )
             unmatched_text = '\n'.join(chunks)
 
