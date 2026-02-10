@@ -8,7 +8,7 @@
         ==============================
         This module allows you to import product information from PDF files
         and create sales quotations directly in Odoo.
-        
+
         Features:
         ---------
         * Upload PDF files via wizard interface
@@ -19,7 +19,7 @@
         * Direct creation of sale.order with order lines
         * Summary of matched and unmatched items
         * No XLSX export/import required
-        
+
         Technical:
         ----------
         * Uses PyPDF2 for PDF text extraction
@@ -30,7 +30,7 @@
     'website': 'https://github.com/BnS-OnM/BenSo-tec',
     'depends': ['sale', 'product'],
     'external_dependencies': {
-        'python': ['PyPDF2'],
+        'python': ['PyPDF2', 'rapidfuzz'],
     },
     'data': [
         'security/ir.model.access.csv',

@@ -1,424 +1,571 @@
 from odoo import models, fields
 from odoo.exceptions import UserError
+
 import base64
 import io
 import logging
 import re
-import unicodedata
 
 _logger = logging.getLogger(__name__)
 
-# Try to import PyPDF2
+# PDF library
 try:
     import PyPDF2
-except ImportError:
-    _logger.warning('PyPDF2 library is not installed. PDF parsing will not work.')
+except Exception:
     PyPDF2 = None
+    _logger.warning("PyPDF2 not installed - PDF parsing will not work.")
 
-# Try to import rapidfuzz, fallback to difflib
+# Fuzzy matcher
 try:
     from rapidfuzz import fuzz
-    HAVE_RF = True
+    FUZZY_MATCHER = "rapidfuzz"
 except Exception:
     from difflib import SequenceMatcher
-    HAVE_RF = False
-    _logger.info('rapidfuzz not available, using difflib for fuzzy matching')
+    FUZZY_MATCHER = "difflib"
+    _logger.info("rapidfuzz not available, using difflib fallback")
 
-# ---------------- Normalisatie helpers ----------------
+
+# Studio property field where brand is stored (your provided field)
+BRAND_PROP_FIELD = "product_properties.8b621cac637a8a24"
+
+# Series keys that often appear in schema PDFs
+SERIE_KEYS = ("vwl", "split", "pure", "tower", "vrc", "vr", "vih", "vp")
+
 
 def _norm_text(s: str) -> str:
     if not s:
-        return ''
-    s = unicodedata.normalize('NFKD', s)
-    s = ''.join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.lower().strip()
-    s = re.sub(r"\s+", ' ', s)
-    return s
-
-def _clean_desc_for_match(desc: str) -> str:
-    if not desc:
-        return ''
-    # verwijder losse prijzen/getallen op het einde (vb. "..., 5.268,00")
-    out = re.sub(r"[\s\-–—]*[\d\.,]+\s*€?$", '', desc.strip())
-    return out
-
-def _clean_code(c: str) -> str:
-    if not c:
-        return ''
-    # verwijder spaties, puntjes, streepjes; uppercase
-    return re.sub(r"[\s\-.]", '', c).upper()
-
-# korte product-prefixen die we NIET willen wegfilteren, ook al zijn ze 2-3 letters
-WHITELIST_PREFIXES = {"vr", "vrc", "vwl", "vih", "vp", "hb"}
+        return ""
+    s = s.replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", s).strip().lower()
 
 
 class PdfToQuoteWizard(models.TransientModel):
-    _name = 'sale.pdf.to.quote.wizard'
-    _description = 'PDF to Quote Wizard'
+    _name = "sale.pdf.to.quote.wizard"
+    _description = "PDF to Quote Wizard"
 
-    # Input fields
-    pdf_file = fields.Binary(string='PDF File', required=True)
-    filename = fields.Char(string='Filename')
-    partner_id = fields.Many2one('res.partner', string='Customer', required=True)
-    use_pdf_prices = fields.Boolean(string='Use PDF Prices', default=True)
-    name_prefix = fields.Char(string='Reference Prefix', default='GPT-001')
+    pdf_file = fields.Binary(string="PDF File", required=True)
+    filename = fields.Char(string="Filename")
+
+    partner_id = fields.Many2one(
+        "res.partner", string="Customer", required=True,
+        help="Select the customer for this quotation"
+    )
+
+    use_pdf_prices = fields.Boolean(
+        string="Use PDF Prices", default=True,
+        help="If enabled and prices are present in PDF, use them. Otherwise let Odoo determine prices."
+    )
+
+    name_prefix = fields.Char(
+        string="Reference Prefix", default="GPT-001",
+        help="Prefix for traceability in origin/client_order_ref"
+    )
+
+    # Optional brand restriction (UI field in wizard)
+    restrict_to_brand = fields.Boolean(string="Restrict to brand", default=False)
+    brand_filter = fields.Char(string="Brand name")
 
     # Result fields
-    sale_order_id = fields.Many2one('sale.order', string='Created Quotation', readonly=True)
-    matched_count = fields.Integer(string='Matched Lines', readonly=True)
-    unmatched_count = fields.Integer(string='Unmatched Lines', readonly=True)
-    unmatched_text = fields.Text(string='Unmatched Items Details', readonly=True)
-    state = fields.Selection([
-        ('draft', 'Draft'),
-        ('done', 'Done'),
-    ], default='draft', string='State')
+    sale_order_id = fields.Many2one("sale.order", string="Created Quotation", readonly=True)
+    matched_count = fields.Integer(string="Matched Lines", readonly=True)
+    unmatched_count = fields.Integer(string="Unmatched Lines", readonly=True)
+    unmatched_text = fields.Text(string="Unmatched Items Details", readonly=True)
+    state = fields.Selection([("draft", "Draft"), ("done", "Done")], default="draft")
 
-    # ---------------- PDF Extractie & Detectie ----------------
+    PREFIX_BRAND_MAP = {
+        # add mapping if you want auto-detect, optional
+        "vaillant": "Vaillant",
+    }
 
-    def _extract_text_from_pdf(self, pdf_bytes):
+    # ---------------- PDF extraction ----------------
+
+    def _extract_text_from_pdf(self, pdf_bytes: bytes) -> str:
         if not PyPDF2:
-            raise UserError('PyPDF2 library is not installed. Please install it using: pip install PyPDF2')
+            raise UserError("PyPDF2 library is not installed. Add PyPDF2==2.12.1 to requirements.txt")
+
         try:
             pdf_file_obj = io.BytesIO(pdf_bytes)
             pdf_reader = PyPDF2.PdfReader(pdf_file_obj)
+
             text_content = []
             for page in pdf_reader.pages:
-                text = page.extract_text()
-                if text:
-                    text_content.append(text)
-            full_text = '\n'.join(text_content)
+                t = page.extract_text()
+                if t:
+                    text_content.append(t)
+
+            full_text = "\n".join(text_content)
             if not full_text or len(full_text.strip()) < 50:
-                raise UserError('PDF bevat geen leesbare tekst (waarschijnlijk scan). Gelieve een tekst-PDF te uploaden.')
+                raise UserError(
+                    "PDF bevat geen leesbare tekst (waarschijnlijk scan). Gelieve een tekst-PDF te uploaden."
+                )
             return full_text
+
         except UserError:
             raise
         except Exception as e:
-            _logger.error('Error extracting PDF text: %s', e)
-            raise UserError(f'Failed to extract text from PDF: {str(e)}')
+            _logger.exception("Error extracting PDF text")
+            raise UserError(f"Failed to extract text from PDF: {e}")
 
-    def _detect_pdf_type(self, text):
-        """Retourneert 'table' of 'bottom_bar'"""
-        text_lower = text.lower()
+    # ---------------- Detect type ----------------
 
-        has_artikel_nr = 'artikel nr' in text_lower or 'artikelnr' in text_lower
-        has_unit_price = 'unit price' in text_lower or 'eenheidsprijs' in text_lower
-        table_pattern = re.compile(r'^\*?\d{5,}\s+\d+\s+', re.MULTILINE)
+    def _detect_pdf_type(self, text: str) -> str:
+        tl = text.lower()
+
+        has_artikel_nr = "artikel nr" in tl or "artikelnr" in tl
+        has_unit_price = "unit price" in tl or "eenheidsprijs" in tl
+
+        table_pattern = re.compile(r"^\*?\d{5,}\s+\d+\s+", re.MULTILINE)
         has_table_pattern = len(table_pattern.findall(text)) > 2
 
-        # case-insensitive checks
-        has_appliances = 'appliances:' in text_lower
-        has_controls = 'controls:' in text_lower
+        has_appliances = "appliances:" in tl
+        has_controls = "controls:" in tl
 
         if has_artikel_nr or has_unit_price or has_table_pattern:
-            _logger.info('Detected PDF type: table (quotation format)')
-            return 'table'
-        elif has_appliances or has_controls:
-            _logger.info('Detected PDF type: bottom_bar (Appliances/Controls format)')
-            return 'bottom_bar'
-        else:
-            lines = text.split('\n')[:30]
-            debug_text = '\n'.join(lines)
-            raise UserError(
-                'Could not detect PDF format. Please check the file.\n\nFirst 30 lines of extracted text:\n' + debug_text
-            )
+            _logger.info("Detected PDF type: table (quotation format)")
+            return "table"
+        if has_appliances or has_controls:
+            _logger.info("Detected PDF type: bottom_bar (Appliances/Controls format)")
+            return "bottom_bar"
+
+        lines = text.split("\n")[:30]
+        raise UserError(
+            "Could not detect PDF format. First 30 lines:\n\n" + "\n".join(lines)
+        )
 
     # ---------------- Parsers ----------------
 
-    def _parse_eu_number(self, number_str):
-        if not number_str:
+    def _parse_eu_number(self, s):
+        if not s:
             return None
         try:
-            cleaned = number_str.strip().replace('.', '').replace(',', '.')
+            cleaned = s.strip().replace(".", "").replace(",", ".")
             return float(cleaned)
-        except (ValueError, AttributeError):
+        except Exception:
             return None
 
-    def _parse_bottom_bar(self, text):
+    def _parse_bottom_bar(self, text: str):
         items = []
-        appliances_match = re.search(r'Appliances:\s*(.+?)(?=Controls:|$)', text, re.DOTALL | re.IGNORECASE)
-        controls_match = re.search(r'Controls:\s*(.+?)(?=$)', text, re.DOTALL | re.IGNORECASE)
+
+        appliances_match = re.search(r"Appliances:\s*(.+?)(?=Controls:|$)", text, re.DOTALL | re.IGNORECASE)
+        controls_match = re.search(r"Controls:\s*(.+?)(?=$)", text, re.DOTALL | re.IGNORECASE)
 
         sections = []
         if appliances_match:
-            sections.append(('Appliances', appliances_match.group(1)))
+            sections.append(("Appliances", appliances_match.group(1)))
         if controls_match:
-            sections.append(('Controls', controls_match.group(1)))
+            sections.append(("Controls", controls_match.group(1)))
 
-        for _section_name, section_text in sections:
-            # split per komma en puntkomma
-            parts = re.split(r',[\s\n]+|;\s*', section_text)
-            for item_text in [p.strip() for p in parts if p and p.strip()]:
-                codes = self._extract_product_codes(item_text)
+        for section_name, section_text in sections:
+            parts = [p.strip() for p in section_text.split(",") if p.strip()]
+            for p in parts:
+                codes = self._extract_product_codes(p)
                 items.append({
-                    'codes': codes,
-                    'desc': item_text,
-                    'qty': 1,
-                    'unit_price': None,
+                    "codes": codes,
+                    "desc": p,
+                    "qty": 1,
+                    "unit_price": None,
                 })
-        _logger.info('Parsed %s items from bottom bar format', len(items))
+
+        _logger.info("Parsed %s items from bottom bar format", len(items))
         return items
 
-    def _extract_product_codes(self, text):
+    def _extract_product_codes(self, text: str):
         codes = []
         patterns = [
-            r'\bVR\d{2,4}\b',
-            r'\bVRC\s*\d{2,4}\b',
-            r'\bVWL\s*\d+(?:\.\d+)?\s*[A-Z]{1,4}\b',
-            r'\bVIH\s*[A-Z]{1,4}\b',
-            r'\bVP\s*RW\s*\d+/\d+\s*[A-Z]\b',
+            r"\bVR\d{2,4}\b",
+            r"\bVRC\s*\d{2,4}\b",
+            r"\bVWL\s*\d+(?:\.\d+)?\s*[A-Z]{1,4}\b",
+            r"\bVIH\s*[A-Z]{1,4}\b",
+            r"\bVP\sRW\s\d+/\d+\s*[A-Z]\b",
         ]
         for pattern in patterns:
-            for match in re.findall(pattern, text, re.IGNORECASE):
-                normalized = re.sub(r'\s+', '', match)
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for m in matches:
+                normalized = re.sub(r"\s+", "", m)
                 codes.append(normalized)
         return codes
 
-    def _parse_table_lines(self, text):
+    def _parse_table_lines(self, text: str):
         items = []
-        lines = text.split('\n')
-        line_pattern = re.compile(r'^(\*?)(\d{5,})\s+(\d+)\s+(.+?)(?:\s+([\d.,]+)\s+([\d.,]+))?$')
+        lines = text.split("\n")
+
+        line_pattern = re.compile(
+            r"^(\*?)(\d{5,})\s+(\d+)\s+(.+?)(?:\s+([\d.,]+)\s+([\d.,]+))?$"
+        )
+
         for line in lines:
             line = line.strip()
             if not line:
                 continue
+
             m = line_pattern.match(line)
-            if m:
-                _asterisk, code, qty_str, description, unit_price_str, _line_total_str = m.groups()
-                code = code.strip()
-                try:
-                    qty = int(qty_str)
-                except ValueError:
-                    qty = 1
-                unit_price = self._parse_eu_number(unit_price_str) if unit_price_str else None
-                items.append({
-                    'code': code,
-                    'qty': qty,
-                    'desc': description.strip(),
-                    'unit_price': unit_price,
-                })
-        _logger.info('Parsed %s items from table format', len(items))
+            if not m:
+                continue
+
+            _, code, qty_str, desc, unit_price_str, _ = m.groups()
+
+            try:
+                qty = int(qty_str)
+            except Exception:
+                qty = 1
+
+            unit_price = self._parse_eu_number(unit_price_str) if unit_price_str else None
+
+            items.append({
+                "code": code.strip(),
+                "qty": qty,
+                "desc": desc.strip(),
+                "unit_price": unit_price,
+            })
+
+        _logger.info("Parsed %s items from table format", len(items))
         return items
 
-    # ---------------- Matching ----------------
+    # ---------------- Matching helpers ----------------
 
-    def _fuzzy_match_score(self, str1, str2):
-        a = _norm_text(str1)
-        b = _norm_text(str2)
-        if HAVE_RF:
-            return fuzz.token_set_ratio(a, b)
-        else:
-            return SequenceMatcher(None, a, b).ratio() * 100
+    def _fuzzy_score(self, a: str, b: str) -> float:
+        a = (a or "").lower()
+        b = (b or "").lower()
+        if FUZZY_MATCHER == "rapidfuzz":
+            return float(fuzz.ratio(a, b))
+        return SequenceMatcher(None, a, b).ratio() * 100.0
 
-    def _search_candidates(self, tokens, langs=("nl_BE", "en_US")):
-        """Zoek breed in product.product (varianten) met beide talen en incl. gearchiveerd."""
-        Product = self.env['product.product']
-        domain = []
-        for t in tokens:
-            domain = ['|', '|'] + domain + [
-                ('name', 'ilike', t),
-                ('product_tmpl_id.name', 'ilike', t),
-                ('default_code', 'ilike', t),
-            ]
-        candidates = self.env['product.product']
-        # merge results over talen
-        for lang in langs:
-            ctx = {'lang': lang, 'active_test': False}
-            res = Product.with_context(**ctx).search(domain or [], limit=400)
-            candidates |= res
-        _logger.debug('Candidates found: %s', len(candidates))
-        return candidates
-
-    def _match_by_code(self, code):
-        """Probeer eerst op artikelcode (default_code), met normalisatie + ilike fallback."""
-        Product = self.env['product.product']
-        Template = self.env['product.template']
-        ctx = {'active_test': False}
-        if not code:
-            return None
-        codes_to_try = code if isinstance(code, list) else [code]
-        for c in codes_to_try:
-            c_norm = _clean_code(c)
-            # exact
-            p = Product.with_context(**ctx).search([('default_code', '=', c)], limit=1)
-            if p:
-                return p
-            # ilike + client-side normalisatie
-            cand = Product.with_context(**ctx).search([('default_code', 'ilike', c.replace(' ', '').replace('-', ''))], limit=80)
-            for x in cand:
-                if _clean_code(x.default_code or '') == c_norm:
-                    return x
-            # template fallback
-            t = Template.with_context(**ctx).search([('default_code', '=', c)], limit=1)
-            if t:
-                p = Product.with_context(**ctx).search([('product_tmpl_id', '=', t.id)], limit=1)
-                if p:
-                    return p
+    def _auto_detect_brand(self, text: str):
+        tl = _norm_text(text)
+        for k, v in self.PREFIX_BRAND_MAP.items():
+            if re.search(r"\b" + re.escape(k.lower()) + r"\b", tl):
+                return v
         return None
 
-    def _build_tokens(self, desc: str, codes_from_desc):
-        """Maak tokens voor domain search. Laat whitelisted korte prefixes (vr, vrc, vwl, vih, vp) toe.
-        Voeg ook codes uit de tekst toe zodat we op default_code kunnen zoeken.
+    def _extract_series_tokens(self, s: str):
+        tl = _norm_text(s)
+        found = set()
+        for k in SERIE_KEYS:
+            if re.search(rf"\b{re.escape(k)}\b", tl):
+                found.add(k)
+        return found
+
+    def _detect_series_from_text(self, text: str):
+        # Prefer lines containing "arotherm"
+        series = set()
+        for line in (text or "").split("\n"):
+            if "arotherm" in _norm_text(line):
+                series |= self._extract_series_tokens(line)
+        if series:
+            return series
+
+        # fallback: scan whole text
+        series |= self._extract_series_tokens(text or "")
+        return series
+
+    def _tokenize(self, s: str):
+        tl = _norm_text(s)
+        toks = [t for t in re.findall(r"[a-z0-9./]+", tl) if len(t) > 1]
+        return toks
+
+    def _token_group(self, token: str):
+        # One OR group for searching name/template/default_code
+        token = token.strip()
+        return [
+            ("name", "ilike", token),
+            ("default_code", "ilike", token),
+            ("product_tmpl_id.name", "ilike", token),
+            ("product_tmpl_id.default_code", "ilike", token),
+        ]
+
+    def _combine_or_groups(self, groups):
         """
-        raw = re.findall(r"[A-Za-z0-9]+", desc or '')
-        tokens = []
-        for t in raw:
-            tl = t.lower()
-            if tl in WHITELIST_PREFIXES:
-                tokens.append(tl)
-                continue
-            if len(tl) > 2 and not tl.isdigit():
-                tokens.append(tl)
-        # voeg codes toe (zonder spaties/streepjes)
-        for c in (codes_from_desc or []):
-            if c:
-                tokens.append(_clean_code(c))
-        # laatste redmiddel: als tokens leeg zijn, neem 1-2 langste woorden uit desc
-        if not tokens and raw:
-            raw_sorted = sorted(set(raw), key=len, reverse=True)
-            tokens = [w.lower() for w in raw_sorted[:2]]
-        # deduplicate behouden volgorde
-        seen = set()
-        ordered = []
-        for t in tokens:
-            if t not in seen:
-                ordered.append(t); seen.add(t)
-        return ordered[:8]
+        groups: list of list[tuple]
+        returns domain like OR over each tuple (flattened)
+        """
+        if not groups:
+            return []
 
-    def _match_product(self, code=None, desc=None):
-        # 1) Code-first
-        product = self._match_by_code(code)
-        if product:
-            _logger.debug('Matched by code: %s', product.display_name)
-            return (product, 100, 'code_exact', product.display_name)
+        atoms = []
+        for g in groups:
+            atoms.extend(g)
 
-        # 2) Fuzzy op beschrijving
-        if desc and len(desc) > 3:
-            # extraheer eventuele codes uit de beschrijving
-            codes_from_desc = self._extract_product_codes(desc)
-            tokens = self._build_tokens(desc, codes_from_desc)
-            candidates = self._search_candidates(tokens) if tokens else self._search_candidates([])
+        if not atoms:
+            return []
 
-            best_score = 0
-            best_product = None
-            best_name = None
-            desc_for_match = _clean_desc_for_match(desc)
+        # OR between all atoms
+        domain = []
+        for _ in range(len(atoms) - 1):
+            domain.append("|")
+        domain.extend(atoms)
+        return domain
 
-            for p in candidates:
-                score = self._fuzzy_match_score(desc_for_match, p.display_name or p.name or '')
-                if score > best_score:
-                    best_score = score
-                    best_product = p
-                    best_name = p.display_name or p.name
+    def _brand_domain(self, brand_name: str, for_model="product.product"):
+        brand_name = (brand_name or "").strip()
+        if not brand_name:
+            return []
+        if for_model == "product.product":
+            # brand stored on template studio field
+            return [(f"product_tmpl_id.{BRAND_PROP_FIELD}", "ilike", brand_name)]
+        # for template model directly
+        return [(BRAND_PROP_FIELD, "ilike", brand_name)]
 
-            # als rapidfuzz ontbreekt, zet cutoff iets lager om difflib-striktheid te compenseren
-            cutoff = 78 if HAVE_RF else 68
-            if best_score >= cutoff and best_product:
-                _logger.debug('Matched by fuzzy (%s%%): %s', best_score, best_name)
-                return (best_product, best_score, 'fuzzy', best_name)
-            elif best_product:
-                _logger.debug('Best fuzzy match (%s%%) below threshold: %s', best_score, best_name)
-                return (None, best_score, 'fuzzy_failed', best_name)
+    def _match_by_code(self, code, brand_name=None):
+        Product = self.env["product.product"].with_context(active_test=False)
+        Template = self.env["product.template"].with_context(active_test=False)
 
-        return (None, 0, None, None)
+        codes = code if isinstance(code, list) else [code]
+        for c in [x for x in codes if x]:
+            dom_p = [("default_code", "=", c)]
+            if brand_name:
+                dom_p = self._brand_domain(brand_name, "product.product") + dom_p
+            p = Product.search(dom_p, limit=1)
+            if p:
+                return p, 100.0, "code_exact", p.display_name
 
-    # ---------------- Hoofdactie ----------------
+            dom_t = [("default_code", "=", c)]
+            if brand_name:
+                dom_t = self._brand_domain(brand_name, "product.template") + dom_t
+            t = Template.search(dom_t, limit=1)
+            if t:
+                p2 = Product.search([("product_tmpl_id", "=", t.id)], limit=1)
+                if p2:
+                    return p2, 100.0, "code_template", p2.display_name
+
+        return None, 0.0, None, None
+
+    def _match_product(self, code=None, desc=None, brand_name=None, schema_mode=False):
+        Product = self.env["product.product"].with_context(active_test=False)
+
+        # 1) exact match by code
+        if code:
+            p, sc, method, cand = self._match_by_code(code, brand_name=brand_name)
+            if p:
+                return p, sc, method, cand
+
+        # 2) fuzzy / token matching
+        if not desc or len(desc.strip()) < 3:
+            return None, 0.0, "no_desc", None
+
+        tokens = self._tokenize(desc)
+
+        # Schema PDFs can be very short; require at least family OR numeric
+        if schema_mode:
+            text = _norm_text(desc)
+            has_family = any(tok in tokens for tok in ("vwl", "vrc", "vr", "vih", "vp"))
+            size_match = re.search(r"\b\d{1,3}(?:[./]\d{1,2})?(?:\.\d{1,2})?\b", text)
+            if not (has_family or size_match):
+                return None, 0.0, "schema_too_vague", None
+
+            # Bring family/size forward if present
+            if "vwl" in tokens:
+                tokens = [t for t in tokens if t != "vwl"]
+                tokens.insert(0, "vwl")
+            if size_match:
+                size_tok = size_match.group(0)
+                tokens.insert(0, size_tok.replace(",", "."))
+
+        # limit tokens for performance
+        tokens = tokens[:6]
+        if not tokens:
+            return None, 0.0, "no_tokens", None
+
+        groups = [self._token_group(t) for t in tokens[:3]]
+        domain = self._combine_or_groups(groups)
+        if brand_name:
+            domain = self._brand_domain(brand_name, "product.product") + (domain or [])
+
+        candidates = Product.search(domain or [], limit=200)
+
+        best_score = 0.0
+        best_product = None
+        best_name = None
+        for p in candidates:
+            score = self._fuzzy_score(desc, p.display_name)
+            if score > best_score:
+                best_score = score
+                best_product = p
+                best_name = p.display_name
+
+        if best_product and best_score >= 80.0:
+            return best_product, best_score, "fuzzy", best_name
+
+        if best_product:
+            return None, best_score, "fuzzy_failed", best_name
+
+        return None, 0.0, "no_candidates", None
+
+    # ---------------- Main action ----------------
 
     def action_create_quotation(self):
         self.ensure_one()
-        if not self.pdf_file:
-            raise UserError('Please upload a PDF file.')
-        if not self.partner_id:
-            raise UserError('Please select a customer.')
 
+        if not self.pdf_file:
+            raise UserError("Please upload a PDF file.")
+        if not self.partner_id:
+            raise UserError("Please select a customer.")
+
+        # Extract text
         pdf_bytes = base64.b64decode(self.pdf_file)
         text = self._extract_text_from_pdf(pdf_bytes)
-        pdf_type = self._detect_pdf_type(text)
-        parsed_items = self._parse_table_lines(text) if pdf_type == 'table' else self._parse_bottom_bar(text)
-        if not parsed_items:
-            raise UserError('No items found in PDF. Please check the file format.')
 
-        _logger.info('Parsed %s items from PDF', len(parsed_items))
+        # Detect type
+        pdf_type = self._detect_pdf_type(text)
+
+        # Parse
+        if pdf_type == "table":
+            parsed_items = self._parse_table_lines(text)
+        else:
+            parsed_items = self._parse_bottom_bar(text)
+
+        if not parsed_items:
+            raise UserError("No items found in PDF. Please check the file format.")
+
+        _logger.info("Parsed %s items from PDF", len(parsed_items))
+
+        # Brand (optional)
+        brand_name = None
+        if self.restrict_to_brand:
+            brand_name = (self.brand_filter or "").strip() or self._auto_detect_brand(text)
+            if brand_name:
+                _logger.info("Brand restriction active on %s via %s", brand_name, BRAND_PROP_FIELD)
+            else:
+                _logger.info("Brand restriction enabled but no brand provided/detected; proceeding without brand filter")
 
         matched_lines = []
         unmatched_items = []
         products_dict = {}
 
-        for item in parsed_items:
-            if pdf_type == 'table':
-                code = item.get('code')
-                desc = item.get('desc', '')
-                qty = item.get('qty', 1)
-                unit_price = item.get('unit_price')
-            else:
-                code = item.get('codes')
-                desc = item.get('desc', '')
-                qty = item.get('qty', 1)
-                unit_price = item.get('unit_price')
+        # --------- Schema (bottom_bar): add all products matching detected series across entire text ---------
+        done_by_series = False
+        if pdf_type == "bottom_bar":
+            series = self._detect_series_from_text(text)
+            _logger.info("Schema series detected in PDF text: %s", ", ".join(sorted(series)) if series else "—")
 
-            product, score, method, candidate_name = self._match_product(code=code, desc=desc)
+            if series:
+                Product = self.env["product.product"].with_context(active_test=False)
+                groups = [self._token_group(s) for s in series]
+                domain = self._combine_or_groups(groups)
+                if brand_name:
+                    domain = self._brand_domain(brand_name, "product.product") + (domain or [])
 
-            if product:
-                if product.id in products_dict:
-                    products_dict[product.id]['qty'] += qty
-                    _logger.debug('Combined duplicate product %s, new qty: %s', product.display_name, products_dict[product.id]['qty'])
+                found = Product.search(domain or [], limit=5000)
+                _logger.info("Schema series search found %s products", len(found))
+
+                if found:
+                    for p in found:
+                        if p.id not in products_dict:
+                            products_dict[p.id] = {
+                                "qty": 1,
+                                "price": None,
+                                "desc": p.display_name or p.name,
+                                "product": p,
+                            }
+                    matched_lines = parsed_items
+                    done_by_series = True
                 else:
-                    products_dict[product.id] = {
-                        'qty': qty,
-                        'price': unit_price if (unit_price and self.use_pdf_prices) else None,
-                        'desc': desc if desc else (product.display_name or product.name),
-                        'product': product,
-                    }
-                matched_lines.append(item)
+                    unmatched_items.append({
+                        "raw": f"Series: {', '.join(sorted(series))}",
+                        "score": 0,
+                        "candidate": "—",
+                        "method": "series_search_empty",
+                    })
             else:
                 unmatched_items.append({
-                    'raw': f"Code: {code}, Desc: {desc}, Qty: {qty}",
-                    'score': score,
-                    'candidate': candidate_name or 'No candidate found',
-                    'method': method or 'no_match',
+                    "raw": "No series tokens found in PDF text",
+                    "score": 0,
+                    "candidate": "—",
+                    "method": "no_series",
                 })
 
-        order_vals = {
-            'partner_id': self.partner_id.id,
-            'origin': f"{self.name_prefix} - {self.filename or 'PDF Import'}",
-            'client_order_ref': f"{self.name_prefix} - {self.filename or 'PDF Import'}",
-        }
-        sale_order = self.env['sale.order'].create(order_vals)
+        # --------- fallback: per-item matching ---------
+        if not done_by_series:
+            for item in parsed_items:
+                if pdf_type == "table":
+                    code = item.get("code")
+                    desc = item.get("desc", "")
+                    qty = item.get("qty", 1)
+                    unit_price = item.get("unit_price")
+                else:
+                    code = item.get("codes")
+                    desc = item.get("desc", "")
+                    qty = item.get("qty", 1)
+                    unit_price = item.get("unit_price")
 
-        for _product_id, line_data in products_dict.items():
-            product = line_data['product']
-            line_vals = {
-                'order_id': sale_order.id,
-                'product_id': product.id,
-                'product_uom_qty': line_data['qty'],                'name': line_data['desc'],
-            }
-            if line_data['price'] is not None:
-                line_vals['price_unit'] = line_data['price']
-            self.env['sale.order.line'].create(line_vals)
-
-        unmatched_text = ''
-        if unmatched_items:
-            chunks = []
-            for item in unmatched_items:
-                chunks.append(
-                    f"• {item['raw']}\n  Best candidate: {item['candidate']} (score: {item['score']:.1f}%)\n"
+                product, score, method, candidate_name = self._match_product(
+                    code=code,
+                    desc=desc,
+                    brand_name=brand_name,
+                    schema_mode=(pdf_type == "bottom_bar"),
                 )
-            unmatched_text = '\n'.join(chunks)
+
+                if product:
+                    if product.id in products_dict:
+                        products_dict[product.id]["qty"] += qty
+                    else:
+                        products_dict[product.id] = {
+                            "qty": qty,
+                            "price": unit_price if (unit_price and self.use_pdf_prices) else None,
+                            "desc": desc if desc else product.display_name,
+                            "product": product,
+                        }
+                    matched_lines.append(item)
+                else:
+                    unmatched_items.append({
+                        "raw": f"Code: {code}, Desc: {desc}, Qty: {qty}",
+                        "score": score,
+                        "candidate": candidate_name or "No candidate found",
+                        "method": method or "no_match",
+                    })
+
+        # Create sale order
+        order_vals = {
+            "partner_id": self.partner_id.id,
+            "origin": f"{self.name_prefix} - {self.filename or 'PDF Import'}",
+            "client_order_ref": f"{self.name_prefix} - {self.filename or 'PDF Import'}",
+        }
+        sale_order = self.env["sale.order"].create(order_vals)
+
+        # Create lines
+        for _, line_data in products_dict.items():
+            product = line_data["product"]
+            line_vals = {
+                "order_id": sale_order.id,
+                "product_id": product.id,
+                "product_uom_qty": line_data["qty"],
+                "product_uom_id": product.uom_id.id,   # Odoo 19 field name
+                "name": line_data["desc"],
+            }
+            if line_data.get("price") is not None:
+                line_vals["price_unit"] = line_data["price"]
+
+            self.env["sale.order.line"].create(line_vals)
+
+        # Unmatched text
+        unmatched_text = ""
+        if unmatched_items:
+            parts = []
+            for it in unmatched_items:
+                parts.append(
+                    f"• {it['raw']}\n"
+                    f"  Best candidate: {it.get('candidate','—')} (score: {it.get('score',0):.1f}%)\n"
+                    f"  Method: {it.get('method','—')}\n"
+                )
+            unmatched_text = "\n".join(parts)
 
         self.write({
-            'sale_order_id': sale_order.id,
-            'matched_count': len(matched_lines),
-            'unmatched_count': len(unmatched_items),
-            'unmatched_text': unmatched_text,
-            'state': 'done',
+            "sale_order_id": sale_order.id,
+            "matched_count": len(matched_lines),
+            "unmatched_count": len(unmatched_items),
+            "unmatched_text": unmatched_text,
+            "state": "done",
         })
 
-        _logger.info('Created sale order %s: %s matched, %s unmatched', sale_order.name, len(matched_lines), len(unmatched_items))
+        _logger.info(
+            "Created sale order %s: %s matched, %s unmatched (brand=%s)",
+            sale_order.name, len(matched_lines), len(unmatched_items), brand_name
+        )
 
         return {
-            'type': 'ir.actions.act_window',
-            'name': 'Created Quotation',
-            'res_model': 'sale.order',
-            'res_id': sale_order.id,
-            'view_mode': 'form',
-            'target': 'current',
+            "type": "ir.actions.act_window",
+            "name": "Created Quotation",
+            "res_model": "sale.order",
+            "res_id": sale_order.id,
+            "view_mode": "form",
+            "target": "current",
         }

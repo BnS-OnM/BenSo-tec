@@ -1,5 +1,0 @@
-id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
-access_pdf_quote_import_user,pdf.quote.import.user,model_pdf_quote_import,sales_team.group_sale_salesman,1,1,1,0
-access_pdf_quote_import_manager,pdf.quote.import.manager,model_pdf_quote_import,sales_team.group_sale_manager,1,1,1,1
-access_pdf_import_wizard_user,pdf.import.wizard.user,model_pdf_import_wizard,sales_team.group_sale_salesman,1,1,1,1
-access_pdf_import_wizard_manager,pdf.import.wizard.manager,model_pdf_import_wizard,sales_team.group_sale_manager,1,1,1,1
