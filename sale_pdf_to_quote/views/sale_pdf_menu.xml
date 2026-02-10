@@ -1,10 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
-    <!-- Menu item under Sales > Orders -->
     <menuitem id="menu_pdf_to_quote"
               name="Importeer PDF naar offerte"
-              parent="sale.sale_order_menu"
-              action="action_pdf_to_quote_wizard"
+              parent="sale.sale_menu_root"
+              action="action_sale_pdf_to_quote_wizard"
               sequence="100"
               groups="sales_team.group_sale_salesman,sales_team.group_sale_manager"/>
 </odoo>
