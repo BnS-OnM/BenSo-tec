@@ -65,6 +65,13 @@ class PdfToQuoteWizard(models.TransientModel):
     restrict_to_brand = fields.Boolean(string="Restrict to brand", default=False)
     brand_filter = fields.Char(string="Brand name")
 
+    # Dummy product (used when not matched on table PDFs)
+    dummy_product_id = fields.Many2one(
+        "product.product",
+        string="Dummy product (niet gevonden)",
+        help="Wordt gebruikt als placeholder wanneer een PDF-regel niet gematcht wordt."
+    )
+
     # Result fields
     sale_order_id = fields.Many2one("sale.order", string="Created Quotation", readonly=True)
     matched_count = fields.Integer(string="Matched Lines", readonly=True)
@@ -73,9 +80,31 @@ class PdfToQuoteWizard(models.TransientModel):
     state = fields.Selection([("draft", "Draft"), ("done", "Done")], default="draft")
 
     PREFIX_BRAND_MAP = {
-        # add mapping if you want auto-detect, optional
         "vaillant": "Vaillant",
     }
+
+    # ---------------- Dummy product ----------------
+
+    def _get_dummy_product(self):
+        """
+        Returns dummy product record.
+        Priority:
+        1) wizard dummy_product_id
+        2) search by default_code = 'PDF-NOT-FOUND'
+        """
+        Product = self.env["product.product"].with_context(active_test=False)
+
+        if self.dummy_product_id:
+            return self.dummy_product_id
+
+        dummy = Product.search([("default_code", "=", "PDF-NOT-FOUND")], limit=1)
+        if dummy:
+            return dummy
+
+        raise UserError(
+            "Geen dummy product ingesteld.\n"
+            "Kies een dummy product in de wizard, of maak een product aan met default_code = 'PDF-NOT-FOUND'."
+        )
 
     # ---------------- PDF extraction ----------------
 
@@ -155,7 +184,7 @@ class PdfToQuoteWizard(models.TransientModel):
         if controls_match:
             sections.append(("Controls", controls_match.group(1)))
 
-        for section_name, section_text in sections:
+        for _, section_text in sections:
             parts = [p.strip() for p in section_text.split(",") if p.strip()]
             for p in parts:
                 codes = self._extract_product_codes(p)
@@ -221,42 +250,6 @@ class PdfToQuoteWizard(models.TransientModel):
         _logger.info("Parsed %s items from table format", len(items))
         return items
 
-    # ---------------- Schema helpers (NEW) ----------------
-
-    def _extract_core_value(self, s: str):
-        """
-        Extract value like '8.2' from text. Accepts '8.2' or '8,2'.
-        Returns normalized string with dot: '8.2' or None.
-        """
-        if not s:
-            return None
-        s2 = (s or "").replace(",", ".")
-        m = re.search(r"\b(\d{1,2}\.\d)\b", s2)
-        if m:
-            return m.group(1)
-        return None
-
-    def _detect_core_value_from_schema_pdf(self, text: str, parsed_items: list):
-        """
-        Try to find core value (like 8.2) from lines containing arotherm (preferred),
-        else from appliances/controls items.
-        """
-        # 1) Prefer lines containing "arotherm"
-        for line in (text or "").split("\n"):
-            if "arotherm" in _norm_text(line):
-                v = self._extract_core_value(line)
-                if v:
-                    return v
-
-        # 2) Fallback: scan parsed items
-        for it in parsed_items or []:
-            v = self._extract_core_value(it.get("desc", ""))
-            if v:
-                return v
-
-        # 3) last resort: scan full text
-        return self._extract_core_value(text or "")
-
     # ---------------- Matching helpers ----------------
 
     def _fuzzy_score(self, a: str, b: str) -> float:
@@ -282,15 +275,12 @@ class PdfToQuoteWizard(models.TransientModel):
         return found
 
     def _detect_series_from_text(self, text: str):
-        # Prefer lines containing "arotherm"
         series = set()
         for line in (text or "").split("\n"):
             if "arotherm" in _norm_text(line):
                 series |= self._extract_series_tokens(line)
         if series:
             return series
-
-        # fallback: scan whole text
         series |= self._extract_series_tokens(text or "")
         return series
 
@@ -300,7 +290,6 @@ class PdfToQuoteWizard(models.TransientModel):
         return toks
 
     def _token_group(self, token: str):
-        # One OR group for searching name/template/default_code
         token = token.strip()
         return [
             ("name", "ilike", token),
@@ -310,21 +299,13 @@ class PdfToQuoteWizard(models.TransientModel):
         ]
 
     def _combine_or_groups(self, groups):
-        """
-        groups: list of list[tuple]
-        returns domain like OR over each tuple (flattened)
-        """
         if not groups:
             return []
-
         atoms = []
         for g in groups:
             atoms.extend(g)
-
         if not atoms:
             return []
-
-        # OR between all atoms
         domain = []
         for _ in range(len(atoms) - 1):
             domain.append("|")
@@ -336,9 +317,7 @@ class PdfToQuoteWizard(models.TransientModel):
         if not brand_name:
             return []
         if for_model == "product.product":
-            # brand stored on template studio field
             return [(f"product_tmpl_id.{BRAND_PROP_FIELD}", "ilike", brand_name)]
-        # for template model directly
         return [(BRAND_PROP_FIELD, "ilike", brand_name)]
 
     def _match_by_code(self, code, brand_name=None):
@@ -368,19 +347,16 @@ class PdfToQuoteWizard(models.TransientModel):
     def _match_product(self, code=None, desc=None, brand_name=None, schema_mode=False):
         Product = self.env["product.product"].with_context(active_test=False)
 
-        # 1) exact match by code
         if code:
             p, sc, method, cand = self._match_by_code(code, brand_name=brand_name)
             if p:
                 return p, sc, method, cand
 
-        # 2) fuzzy / token matching
         if not desc or len(desc.strip()) < 3:
             return None, 0.0, "no_desc", None
 
         tokens = self._tokenize(desc)
 
-        # Schema PDFs can be very short; require at least family OR numeric
         if schema_mode:
             text = _norm_text(desc)
             has_family = any(tok in tokens for tok in ("vwl", "vrc", "vr", "vih", "vp"))
@@ -388,7 +364,6 @@ class PdfToQuoteWizard(models.TransientModel):
             if not (has_family or size_match):
                 return None, 0.0, "schema_too_vague", None
 
-            # Bring family/size forward if present
             if "vwl" in tokens:
                 tokens = [t for t in tokens if t != "vwl"]
                 tokens.insert(0, "vwl")
@@ -396,7 +371,6 @@ class PdfToQuoteWizard(models.TransientModel):
                 size_tok = size_match.group(0)
                 tokens.insert(0, size_tok.replace(",", "."))
 
-        # limit tokens for performance
         tokens = tokens[:6]
         if not tokens:
             return None, 0.0, "no_tokens", None
@@ -436,8 +410,11 @@ class PdfToQuoteWizard(models.TransientModel):
         if not self.partner_id:
             raise UserError("Please select a customer.")
 
-        # Extract text
+        # Keep original PDF bytes for attachment
+        pdf_b64 = self.pdf_file
         pdf_bytes = base64.b64decode(self.pdf_file)
+
+        # Extract text
         text = self._extract_text_from_pdf(pdf_bytes)
 
         # Detect type
@@ -467,38 +444,21 @@ class PdfToQuoteWizard(models.TransientModel):
         unmatched_items = []
         products_dict = {}
 
-        # --------- Schema (bottom_bar): add all products matching detected series AND core value (e.g. 8.2) ---------
+        # --------- Schema (bottom_bar): add all products matching detected series across entire text ---------
         done_by_series = False
         if pdf_type == "bottom_bar":
             series = self._detect_series_from_text(text)
-            core_value = self._detect_core_value_from_schema_pdf(text, parsed_items)
-
             _logger.info("Schema series detected in PDF text: %s", ", ".join(sorted(series)) if series else "—")
-            _logger.info("Schema core value detected: %s", core_value or "—")
 
             if series:
                 Product = self.env["product.product"].with_context(active_test=False)
-
-                # Base domain from series tokens
                 groups = [self._token_group(s) for s in series]
                 domain = self._combine_or_groups(groups)
-
-                # Optional brand filter
                 if brand_name:
                     domain = self._brand_domain(brand_name, "product.product") + (domain or [])
 
-                # NEW: core value filter (only products containing 8.2 in name)
-                if core_value:
-                    domain = (domain or []) + [("name", "ilike", core_value)]
-
                 found = Product.search(domain or [], limit=5000)
-
-                # Extra safety filter (handles commas, display_name vs name)
-                if core_value:
-                    cv = core_value.replace(",", ".")
-                    found = found.filtered(lambda p: cv in ((p.display_name or p.name or "").replace(",", ".")))
-
-                _logger.info("Schema series+core search found %s products", len(found))
+                _logger.info("Schema series search found %s products", len(found))
 
                 if found:
                     for p in found:
@@ -513,10 +473,10 @@ class PdfToQuoteWizard(models.TransientModel):
                     done_by_series = True
                 else:
                     unmatched_items.append({
-                        "raw": f"Series: {', '.join(sorted(series))} | core={core_value or '—'}",
+                        "raw": f"Series: {', '.join(sorted(series))}",
                         "score": 0,
                         "candidate": "—",
-                        "method": "series_core_search_empty",
+                        "method": "series_search_empty",
                     })
             else:
                 unmatched_items.append({
@@ -566,6 +526,19 @@ class PdfToQuoteWizard(models.TransientModel):
                         "method": method or "no_match",
                     })
 
+                    # For table PDFs: add dummy product line so it appears in quotation
+                    if pdf_type == "table":
+                        dummy = self._get_dummy_product()
+                        if dummy.id in products_dict:
+                            products_dict[dummy.id]["qty"] += qty
+                        else:
+                            products_dict[dummy.id] = {
+                                "qty": qty,
+                                "price": unit_price if (unit_price and self.use_pdf_prices) else None,
+                                "desc": (desc or "").strip() or (code or "").strip() or "Niet gevonden (PDF)",
+                                "product": dummy,
+                            }
+
         # Create sale order
         order_vals = {
             "partner_id": self.partner_id.id,
@@ -573,6 +546,20 @@ class PdfToQuoteWizard(models.TransientModel):
             "client_order_ref": f"{self.name_prefix} - {self.filename or 'PDF Import'}",
         }
         sale_order = self.env["sale.order"].create(order_vals)
+
+        # NEW: attach uploaded PDF to the quotation
+        attach_name = self.filename or "import.pdf"
+        if not attach_name.lower().endswith(".pdf"):
+            attach_name = f"{attach_name}.pdf"
+
+        self.env["ir.attachment"].create({
+            "name": attach_name,
+            "type": "binary",
+            "datas": pdf_b64,  # already base64 in Odoo binary field
+            "mimetype": "application/pdf",
+            "res_model": "sale.order",
+            "res_id": sale_order.id,
+        })
 
         # Create lines
         for _, line_data in products_dict.items():
