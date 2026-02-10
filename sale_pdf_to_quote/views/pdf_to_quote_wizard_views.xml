@@ -19,7 +19,7 @@
 
                         <group string="Optional filters">
                             <field name="restrict_to_brand"/>
-                            <field name="brand_filter" invisible="not restrict_to_brand"/>
+                            <field name="brand_filter" invisible="restrict_to_brand == False"/>
                         </group>
                     </group>
 
