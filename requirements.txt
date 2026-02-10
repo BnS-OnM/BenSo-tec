@@ -1,2 +1,0 @@
-rapidfuzz==3.14.3
-PyPDF2==2.12.1
