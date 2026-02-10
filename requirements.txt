@@ -1,3 +1,2 @@
 rapidfuzz==3.14.3
-PyPDF2>=3.0.0
-PyPDF2<3.0.0
+PyPDF2>=2.10.5,<3.0.0
