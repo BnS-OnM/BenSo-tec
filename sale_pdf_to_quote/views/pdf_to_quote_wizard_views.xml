@@ -1,50 +1,57 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
-    <record id="view_pdf_to_quote_wizard_form" model="ir.ui.view">
-        <field name="name">pdf.to.quote.wizard.form</field>
+    <record id="view_sale_pdf_to_quote_wizard_form" model="ir.ui.view">
+        <field name="name">sale.pdf.to.quote.wizard.form</field>
         <field name="model">sale.pdf.to.quote.wizard</field>
         <field name="arch" type="xml">
-            <form string="Import PDF to Quotation">
-                <group>
-                    <group name="input_fields" invisible="state == 'done'">
-                        <field name="state" invisible="1"/>
-                        <field name="pdf_file" filename="filename" widget="binary"/>
-                        <field name="filename" invisible="1"/>
-                        <field name="partner_id" options="{'no_create': True, 'no_open': True}"/>
-                        <field name="use_pdf_prices"/>
-                        <field name="name_prefix"/>
+            <form string="PDF to Quotation">
+                <sheet>
+                    <group>
+                        <group string="Input">
+                            <field name="pdf_file" filename="filename"/>
+                            <field name="filename"/>
+                            <field name="partner_id" options="{'no_create': False}"/>
+                            <field name="use_pdf_prices"/>
+                            <field name="name_prefix"/>
+                        </group>
+
+                        <group string="Optional filters">
+                            <field name="restrict_to_brand"/>
+                            <field name="brand_filter"
+                                   attrs="{'invisible':[('restrict_to_brand','=',False)]}"/>
+                        </group>
                     </group>
-                    
-                    <group name="result_fields" invisible="state != 'done'">
-                        <field name="sale_order_id" readonly="1"/>
-                        <field name="matched_count" readonly="1"/>
-                        <field name="unmatched_count" readonly="1"/>
+
+                    <footer>
+                        <button name="action_create_quotation"
+                                string="Create Quotation"
+                                type="object"
+                                class="btn-primary"
+                                attrs="{'invisible':[('state','=','done')]}"/>
+                        <button string="Close" class="btn-secondary" special="cancel"
+                                attrs="{'invisible':[('state','=','done')]}"/>
+                    </footer>
+
+                    <group attrs="{'invisible':[('state','!=','done')]}">
+                        <group string="Result">
+                            <field name="sale_order_id" readonly="1"/>
+                            <field name="matched_count" readonly="1"/>
+                            <field name="unmatched_count" readonly="1"/>
+                        </group>
+                        <group string="Unmatched details">
+                            <field name="unmatched_text" nolabel="1" readonly="1"/>
+                        </group>
                     </group>
-                </group>
-                
-                <notebook invisible="state != 'done'">
-                    <page string="Unmatched Items" invisible="unmatched_count == 0">
-                        <field name="unmatched_text" readonly="1" nolabel="1"/>
-                    </page>
-                </notebook>
-                
-                <footer>
-                    <button name="action_create_quotation" 
-                            string="Maak offerte" 
-                            type="object" 
-                            class="btn-primary"
-                            invisible="state == 'done'"/>
-                    <button string="Close" class="btn-secondary" special="cancel"/>
-                </footer>
+
+                </sheet>
             </form>
         </field>
     </record>
 
-    <record id="action_pdf_to_quote_wizard" model="ir.actions.act_window">
-        <field name="name">Importeer PDF naar offerte</field>
+    <record id="action_sale_pdf_to_quote_wizard" model="ir.actions.act_window">
+        <field name="name">PDF to Quotation</field>
         <field name="res_model">sale.pdf.to.quote.wizard</field>
         <field name="view_mode">form</field>
         <field name="target">new</field>
-        <field name="binding_model_id" ref="sale.model_sale_order"/>
     </record>
 </odoo>
