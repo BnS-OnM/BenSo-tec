@@ -52,10 +52,12 @@
         </field>
     </record>
 
-    <record id="action_sale_pdf_to_quote_wizard" model="ir.actions.act_window">
-        <field name="name">PDF to Quotation</field>
-        <field name="res_model">sale.pdf.to.quote.wizard</field>
-        <field name="view_mode">form</field>
-        <field name="target">new</field>
-    </record>
+   <record id="action_sale_pdf_to_quote_wizard" model="ir.actions.act_window">
+    <field name="name">PDF to Quotation</field>
+    <field name="res_model">sale.pdf.to.quote.wizard</field>
+    <field name="view_mode">form</field>
+    <field name="view_id" ref="view_sale_pdf_to_quote_wizard_form"/>
+    <field name="target">new</field>
+   </record>
+
 </odoo>
