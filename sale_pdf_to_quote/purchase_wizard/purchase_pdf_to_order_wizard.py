@@ -474,7 +474,7 @@ class PurchasePdfToOrderWizard(models.TransientModel):
                 "order_id": purchase_order.id,
                 "product_id": product.id,
                 "product_qty": line_data["qty"],  # Odoo 19 field name for purchase
-                "product_uom": product.uom_id.id,
+                "product_uom_id": product.uom_id.id,  # Odoo 19 field name
                 "name": line_data["desc"],
             }
             if line_data.get("price") is not None:
