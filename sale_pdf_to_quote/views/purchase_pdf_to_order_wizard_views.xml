@@ -10,7 +10,8 @@
                         <group string="Input">
                             <field name="pdf_file" filename="filename"/>
                             <field name="filename"/>
-                            <field name="vendor_id" options="{'no_create': False}"/>
+                            <field name="partner_id" options="{'no_create': False}"/>
+                            <field name="use_pdf_prices"/>
                             <field name="name_prefix"/>
                         </group>
                     </group>
@@ -19,7 +20,6 @@
                         <group string="Result">
                             <field name="purchase_order_id" readonly="1"/>
                             <field name="matched_count" readonly="1"/>
-                            <field name="created_products_count" readonly="1"/>
                             <field name="unmatched_count" readonly="1"/>
                         </group>
                         <group string="Unmatched details">
