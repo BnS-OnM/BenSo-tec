@@ -143,4 +143,6 @@ class PurchasePdfToOrderWizard(models.TransientModel):
             # als eerste lijn lijkt op bedrijfsnaam
             cand = first_lines[0].strip()
             if 2 <= len(cand) <= 80 and not re.search(r"\d{3,}", cand):
-               
+                return cand
+        
+        return None
