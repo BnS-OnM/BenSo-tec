@@ -135,21 +135,17 @@ class PurchasePdfToOrderWizard(models.TransientModel):
             m = re.search(pat, tl, re.IGNORECASE)
             if m:
                 name = _norm_text(m.group(1))
-                # stop aan lijn-einde / dubbele spaties
                 name = name.split("\n")[0].strip()
-                # afkappen als er extra stukjes zijn
                 name = re.split(r"\s{2,}", name)[0].strip()
                 if len(name) >= 2:
                     return name
 
-        # fallback: soms staat vendor bovenaan in eerste regels
         first_lines = [l.strip() for l in text.split("\n")[:10] if l.strip()]
         if first_lines:
-            # als eerste lijn lijkt op bedrijfsnaam
             cand = first_lines[0].strip()
             if 2 <= len(cand) <= 80 and not re.search(r"\d{3,}", cand):
                 return cand
-        
+
         return None
 
     # ---------------- Detect type ----------------
@@ -295,6 +291,71 @@ class PurchasePdfToOrderWizard(models.TransientModel):
         domain.extend(atoms)
         return domain
 
+    def _product_from_template(self, tmpl):
+        if not tmpl:
+            return None
+        if hasattr(tmpl, "product_variant_id") and tmpl.product_variant_id:
+            return tmpl.product_variant_id
+        return self.env["product.product"].with_context(active_test=False).search(
+            [("product_tmpl_id", "=", tmpl.id)], limit=1
+        )
+
+    def _match_by_vendor_fields(self, vendor, code, desc):
+        """
+        FIRST: search in seller_ids/product_code and seller_ids/product_name for that vendor.
+        - seller_ids = product.supplierinfo on product.template
+        """
+        if not vendor:
+            return None, 0.0, "no_vendor", None
+
+        ProductTmpl = self.env["product.template"].with_context(active_test=False)
+        SupplierInfo = self.env["product.supplierinfo"].with_context(active_test=False)
+
+        code_n = (code or "").strip()
+        desc_n = _norm_lower(desc or "")
+
+        # 1) seller_ids.product_code
+        if code_n:
+            si = SupplierInfo.search(
+                [("partner_id", "=", vendor.id), ("product_code", "ilike", code_n)],
+                limit=1
+            )
+            if si:
+                p = si.product_id or self._product_from_template(si.product_tmpl_id)
+                if p:
+                    return p, 100.0, "seller_ids.product_code", p.display_name
+
+            tmpl = ProductTmpl.search(
+                [("seller_ids.partner_id", "=", vendor.id), ("seller_ids.product_code", "ilike", code_n)],
+                limit=1
+            )
+            if tmpl:
+                p = self._product_from_template(tmpl)
+                if p:
+                    return p, 100.0, "seller_ids.product_code_tmpl", p.display_name
+
+        # 2) seller_ids.product_name (fuzzy)
+        if desc_n:
+            tmpls = ProductTmpl.search(
+                [("seller_ids.partner_id", "=", vendor.id), ("seller_ids.product_name", "ilike", desc_n[:25])],
+                limit=80
+            )
+            best_p = None
+            best_sc = 0.0
+            best_name = None
+            for tmpl in tmpls:
+                for si in tmpl.seller_ids.filtered(lambda s: s.partner_id.id == vendor.id):
+                    cand_name = si.product_name or tmpl.name
+                    sc = self._fuzzy_score(desc, cand_name)
+                    if sc > best_sc:
+                        best_sc = sc
+                        best_p = self._product_from_template(tmpl)
+                        best_name = best_p.display_name if best_p else tmpl.display_name
+            if best_p and best_sc >= 80.0:
+                return best_p, best_sc, "seller_ids.product_name", best_name
+
+        return None, 0.0, "no_seller_match", None
+
     def _match_by_code(self, code):
         Product = self.env["product.product"].with_context(active_test=False)
         Template = self.env["product.template"].with_context(active_test=False)
@@ -315,25 +376,37 @@ class PurchasePdfToOrderWizard(models.TransientModel):
 
         return None, 0.0, None, None
 
-    def _match_product(self, code=None, desc=None):
+    def _match_product(self, vendor=None, code=None, desc=None):
+        """
+        Matching order:
+        1) seller_ids.product_code / seller_ids.product_name (vendor-specific)
+        2) default_code exact (global)
+        3) fuzzy on product fields (global)
+        """
         Product = self.env["product.product"].with_context(active_test=False)
 
+        # 1) FIRST vendor seller fields
+        if vendor:
+            p, sc, method, cand = self._match_by_vendor_fields(vendor, code, desc)
+            if p:
+                return p, sc, method, cand
+
+        # 2) then try exact by default_code
         if code:
             p, sc, method, cand = self._match_by_code(code)
             if p:
                 return p, sc, method, cand
 
+        # 3) fuzzy / token matching on global product
         if not desc or len(desc.strip()) < 3:
             return None, 0.0, "no_desc", None
 
-        tokens = self._tokenize(desc)
-        tokens = tokens[:6]
+        tokens = self._tokenize(desc)[:6]
         if not tokens:
             return None, 0.0, "no_tokens", None
 
         groups = [self._token_group(t) for t in tokens[:3]]
         domain = self._combine_or_groups(groups)
-
         candidates = Product.search(domain or [], limit=200)
 
         best_score = 0.0
@@ -348,7 +421,6 @@ class PurchasePdfToOrderWizard(models.TransientModel):
 
         if best_product and best_score >= 80.0:
             return best_product, best_score, "fuzzy", best_name
-
         if best_product:
             return None, best_score, "fuzzy_failed", best_name
 
@@ -359,7 +431,6 @@ class PurchasePdfToOrderWizard(models.TransientModel):
     def action_create_purchase_order(self):
         """
         Main action to create a purchase order from the PDF.
-        Follows the pattern from action_create_quotation in the sales wizard.
         """
         self.ensure_one()
 
@@ -384,7 +455,7 @@ class PurchasePdfToOrderWizard(models.TransientModel):
                     _logger.info("Vendor detected and found: %s", vendor.name)
                 else:
                     _logger.info("Vendor name detected (%s) but not found in database", vendor_name)
-        
+
         if not vendor:
             raise UserError(
                 "No vendor provided or detected.\n"
@@ -423,6 +494,7 @@ class PurchasePdfToOrderWizard(models.TransientModel):
                 unit_price = item.get("unit_price")
 
             product, score, method, candidate_name = self._match_product(
+                vendor=vendor,
                 code=code,
                 desc=desc,
             )
@@ -467,15 +539,16 @@ class PurchasePdfToOrderWizard(models.TransientModel):
             "res_id": purchase_order.id,
         })
 
-        # Create lines (using product_qty for Odoo 19 purchase.order.line)
+        # Create lines
         for _, line_data in products_dict.items():
             product = line_data["product"]
             line_vals = {
                 "order_id": purchase_order.id,
                 "product_id": product.id,
-                "product_qty": line_data["qty"],  # Odoo 19 field name for purchase
-                "product_uom_id": product.uom_id.id,  # Odoo 19 field name
+                "product_qty": line_data["qty"],       # purchase.order.line qty
+                "product_uom_id": (product.uom_po_id.id if product.uom_po_id else product.uom_id.id),
                 "name": line_data["desc"],
+                "date_planned": fields.Datetime.now(),
             }
             if line_data.get("price") is not None:
                 line_vals["price_unit"] = line_data["price"]
