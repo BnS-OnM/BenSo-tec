@@ -1,8 +1,8 @@
-# PDF to Sales Quotation
+# PDF to Sales Quotation and Purchase Order
 
 ## Description
 
-This Odoo module allows you to import product information from PDF files and create sales quotations directly in Odoo without any intermediate XLSX export/import steps.
+This Odoo module allows you to import product information from PDF files and create sales quotations or purchase orders directly in Odoo without any intermediate XLSX export/import steps.
 
 ## Features
 
@@ -14,7 +14,9 @@ This Odoo module allows you to import product information from PDF files and cre
   - Primary matching by product code (default_code)
   - Fallback to fuzzy name matching (≥80% similarity)
   - Support for various code formats (VR, VRC, VWL, VIH, VP RW series)
-- **Direct Sale Order Creation**: Creates sale.order with order lines directly from PDF
+- **Direct Order Creation**: 
+  - Creates sale.order with order lines directly from PDF (Sales wizard)
+  - Creates purchase.order with order lines directly from PDF (Purchase wizard)
 - **Flexible Pricing**: Option to use prices from PDF or let Odoo determine prices
 - **Duplicate Handling**: Automatically combines quantities for duplicate products
 - **Detailed Summary**: Shows matched and unmatched items with best candidates
@@ -31,16 +33,19 @@ This Odoo module allows you to import product information from PDF files and cre
 
 3. The module depends on:
    - `sale` (Sales Management)
+   - `purchase` (Purchase Management)
    - `product` (Product)
 
 ## Usage
 
-### Accessing the Wizard
+### Sales Wizard
+
+#### Accessing the Wizard
 
 1. Navigate to **Sales > Orders > Importeer PDF naar offerte**
 2. Or from the Quotations list view, use the action menu
 
-### Using the Wizard
+#### Using the Wizard
 
 1. **Upload PDF File**: Select your PDF file
 2. **Select Customer**: Choose the customer for this quotation (required)
@@ -50,10 +55,35 @@ This Odoo module allows you to import product information from PDF files and cre
 4. **Reference Prefix**: Set a prefix for traceability (default: "GPT-001")
 5. Click **"Maak offerte"** to create the quotation
 
-### After Processing
+#### After Processing
 
 The wizard will show:
 - Link to the created sale order
+- Number of matched product lines
+- Number of unmatched items
+- Details of unmatched items with best match candidates
+
+### Purchase Wizard
+
+#### Accessing the Wizard
+
+1. Navigate to **Purchase > Orders > Import PDF to Purchase Order**
+2. Or from the Purchase Orders list view, use the action menu
+
+#### Using the Wizard
+
+1. **Upload PDF File**: Select your PDF file
+2. **Select Vendor**: Choose the vendor for this purchase order (required)
+3. **Use PDF Prices**: 
+   - Enable to use prices from PDF (when available)
+   - Disable to let Odoo determine prices
+4. **Reference Prefix**: Set a prefix for traceability (default: "GPT-001")
+5. Click **"Create Purchase Order"** to create the order
+
+#### After Processing
+
+The wizard will show:
+- Link to the created purchase order
 - Number of matched product lines
 - Number of unmatched items
 - Details of unmatched items with best match candidates
@@ -93,7 +123,7 @@ Format: `article_number quantity description [unit_price] [line_total]`
 
 3. **Unmatched Items**:
    - Tracked with raw data and best candidate
-   - Sale order is still created with matched items
+   - Order (sale or purchase) is still created with matched items
 
 ## Supported Product Code Patterns
 
@@ -107,16 +137,30 @@ The module recognizes these code patterns:
 ## Limitations
 
 - **No OCR Support**: The module requires text-based PDFs. Scanned PDFs without embedded text will be rejected.
-- **No Automatic Partner Detection**: You must manually select the customer.
+- **No Automatic Partner Detection**: You must manually select the customer (sales) or vendor (purchase).
 - **Format Detection**: Only supports the 2 predefined formats. Other formats will result in an error with debug information.
 - **Price Format**: Only European number format (1.234,56) is supported for table format PDFs.
 
 ## Technical Details
 
-- **Model**: `sale.pdf.to.quote.wizard` (TransientModel)
+- **Sales Model**: `sale.pdf.to.quote.wizard` (TransientModel)
+- **Purchase Model**: `purchase.pdf.to.order.wizard` (TransientModel)
 - **Dependencies**: PyPDF2 (required), rapidfuzz (optional but recommended)
 - **Odoo Compatibility**: Designed for Odoo 16/17/19
-- **Security**: Accessible by Sales > Salesman and Sales > Manager groups
+- **Security**: Accessible by Sales/Purchase > User and Sales/Purchase > Manager groups
+
+## Bug Fix (v19.0.2.0.0)
+
+This version fixes a critical error in the purchase wizard:
+```
+ValueError: Invalid field 'product_uom' on model 'purchase.order.line'
+```
+
+**Root Cause**: The purchase wizard was using the incorrect field name `product_uom` instead of `product_uom_id` when creating purchase order lines.
+
+**Fix**: Updated to use correct Odoo field names:
+- `product_uom_id` for unit of measure (Many2one field - must end with `_id`)
+- `product_qty` for quantity (purchase.order.line uses different field names than sale.order.line)
 
 ## Troubleshooting
 
