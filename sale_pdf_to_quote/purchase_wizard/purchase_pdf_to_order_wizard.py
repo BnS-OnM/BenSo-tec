@@ -146,3 +146,34 @@ class PurchasePdfToOrderWizard(models.TransientModel):
                 return cand
         
         return None
+
+    # ---------------- Main action ----------------
+
+    def action_create_purchase_order(self):
+        """
+        Main action to create a purchase order from the PDF.
+        This is a placeholder implementation that needs to be completed
+        based on the actual business requirements.
+        """
+        self.ensure_one()
+
+        if not self.pdf_file:
+            raise UserError("Please upload a PDF file.")
+
+        # For now, just update the state to show completion
+        # TODO: Implement full purchase order creation logic
+        self.write({
+            "state": "done",
+            "matched_count": 0,
+            "created_products_count": 0,
+            "unmatched_count": 0,
+            "unmatched_text": "Implementation pending",
+        })
+
+        return {
+            "type": "ir.actions.act_window",
+            "res_model": "purchase.pdf.to.order.wizard",
+            "res_id": self.id,
+            "view_mode": "form",
+            "target": "new",
+        }
