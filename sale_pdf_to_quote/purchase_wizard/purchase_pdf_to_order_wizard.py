@@ -96,7 +96,7 @@ class PurchasePdfToOrderWizard(models.TransientModel):
             full_text = "\n".join(text_content)
             if not full_text or len(full_text.strip()) < 50:
                 raise UserError(
-                    "PDF bevat geen leesbare tekst (waarschijnlijk scan). Gelieve een tekst-PDF te uploaden."
+                    "PDF contains no readable text (likely a scan). Please upload a text-based PDF."
                 )
             return full_text
 
@@ -573,7 +573,7 @@ class PurchasePdfToOrderWizard(models.TransientModel):
         }
         purchase_order = self.env["purchase.order"].create(order_vals)
 
-        # Create lines - THIS IS LINE 483 WHERE THE BUG WAS
+        # Create lines for purchase order
         for _, line_data in products_dict.items():
             product = line_data["product"]
             line_vals = {
