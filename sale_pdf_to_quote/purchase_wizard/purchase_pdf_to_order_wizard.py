@@ -546,7 +546,7 @@ class PurchasePdfToOrderWizard(models.TransientModel):
                 "order_id": purchase_order.id,
                 "product_id": product.id,
                 "product_qty": line_data["qty"],       # purchase.order.line qty
-                "product_uom_id": (product.uom_po_id.id if product.uom_po_id else product.uom_id.id),
+                "product_uom_id": product.uom_id.id,   # Odoo 19: use standard UoM
                 "name": line_data["desc"],
                 "date_planned": fields.Datetime.now(),
             }
